@@ -30,7 +30,9 @@ use super::{
 };
 use crate::error::GraphError;
 use crate::executors::trtx::create_trtx_logger;
-use crate::graph::{DataType, GraphInfo, OperandKind, get_static_or_max_size};
+use crate::graph::{
+    DataType, DefaultWeightsContext, GraphInfo, OperandKind, WeightsContext, get_static_or_max_size,
+};
 use crate::operator_options::{MLDimension, MLPool2dOptions};
 use crate::operators::Operation;
 use crate::shape_inference::{infer_arg_reduce_shape, infer_pool2d_shape, infer_where_shape};
@@ -156,14 +158,16 @@ impl TrtxConverter {
     }
 
     /// Get constant data as bytes
-    fn get_constant_data(graph: &GraphInfo, operand_id: u32) -> Result<&[u8], GraphError> {
+    fn get_constant_data<'weights>(
+        graph: &'weights GraphInfo,
+        operand_id: u32,
+        resolver: &mut (impl WeightsContext<'weights> + 'weights),
+    ) -> Result<&'weights [u8], GraphError> {
         graph
-            .constant_operand_ids_to_handles
-            .get(&operand_id)
-            .map(|constant_data| constant_data.data.as_slice())
-            .ok_or_else(|| GraphError::ConversionFailed {
+            .resolve_constant(operand_id, resolver)
+            .map_err(|e| GraphError::ConversionFailed {
                 format: "trtx".to_string(),
-                reason: format!("Operand {} is not a constant", operand_id),
+                reason: format!("Operand {operand_id} is not a constant: {e}"),
             })
     }
 
@@ -292,7 +296,20 @@ impl TrtxConverter {
         graph: &'a GraphInfo,
         network: &mut trtx::NetworkDefinition<'a>,
     ) -> Result<(), GraphError> {
-        let mut tensor_map: HashMap<u32, trtx::Tensor<'a>> = HashMap::new();
+        TrtxConverter::build_network_with_weight_context(
+            graph,
+            network,
+            &mut DefaultWeightsContext {},
+        )
+    }
+
+    /// Build TensorRT network from WebNN graph.
+    pub fn build_network_with_weight_context<'weights>(
+        graph: &'weights GraphInfo,
+        network: &mut trtx::NetworkDefinition<'weights>,
+        weight_context: &mut (impl WeightsContext<'weights> + 'weights),
+    ) -> Result<(), GraphError> {
+        let mut tensor_map: HashMap<u32, trtx::Tensor<'weights>> = HashMap::new();
         let promoted_constants: HashSet<u32> = HashSet::new();
         let io_binding_names = Self::engine_io_binding_names(graph);
 
@@ -338,7 +355,7 @@ impl TrtxConverter {
                     .iter()
                     .map(|d| get_static_or_max_size(d) as i32)
                     .collect();
-                let data = Self::get_constant_data(graph, operand_id as u32)?;
+                let data = Self::get_constant_data(graph, operand_id as u32, weight_context)?;
 
                 // Validate that data size matches expected packed byte length
                 let expected_bytes = operand.descriptor.byte_length().ok_or_else(|| {
@@ -440,6 +457,7 @@ impl TrtxConverter {
                 &mut tensor_map,
                 &promoted_constants,
                 operation,
+                weight_context,
             )?;
         }
 
@@ -467,12 +485,13 @@ impl TrtxConverter {
     }
 
     /// Add a single operation to the network
-    fn add_operation<'network_definition>(
-        graph: &'network_definition GraphInfo,
-        network: &mut trtx::NetworkDefinition<'network_definition>,
-        tensor_map: &mut HashMap<u32, trtx::Tensor<'network_definition>>,
+    fn add_operation<'weights>(
+        graph: &'weights GraphInfo,
+        network: &mut trtx::NetworkDefinition<'weights>,
+        tensor_map: &mut HashMap<u32, trtx::Tensor<'weights>>,
         promoted_constants: &HashSet<u32>,
         operation: &Operation,
+        weight_context: &mut (impl WeightsContext<'weights> + 'weights),
     ) -> Result<(), GraphError> {
         let op_type = operation.op_type();
 
@@ -616,9 +635,13 @@ impl TrtxConverter {
             "instanceNormalization" => {
                 Self::add_instance_normalization_op(graph, network, tensor_map, operation)?
             }
-            "layerNormalization" => {
-                Self::add_layer_normalization_op(graph, network, tensor_map, operation)?
-            }
+            "layerNormalization" => Self::add_layer_normalization_op(
+                graph,
+                network,
+                tensor_map,
+                operation,
+                weight_context,
+            )?,
 
             // Reduction operations
             "reduceSum" => {
@@ -698,7 +721,9 @@ impl TrtxConverter {
                 operation,
                 ElementWiseOperation::kXOR,
             )?,
-            "logicalNot" => Self::add_logical_not_op(graph, network, tensor_map, operation)?,
+            "logicalNot" => {
+                Self::add_logical_not_op(graph, network, tensor_map, operation, weight_context)?
+            }
 
             // Indexing/Gathering operations
             "gather" => Self::add_gather_op(graph, network, tensor_map, operation)?,
@@ -1315,10 +1340,11 @@ impl TrtxConverter {
     /// Quantized constants (kINT8) may only feed DQ/plugin; for UInt8/Int8 constant, add a kBOOL
     /// constant (0 -> false, non-zero -> true) and feed it directly to kNOT so no extra Cast is needed.
     fn add_logical_not_op<'a>(
-        graph: &GraphInfo,
+        graph: &'a GraphInfo,
         network: &mut trtx::NetworkDefinition<'a>,
         tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
+        resolver: &mut (impl WeightsContext<'a> + 'a),
     ) -> Result<(), GraphError> {
         let input_id = operation.input_operands()[0];
         let input = tensor_map
@@ -1340,7 +1366,7 @@ impl TrtxConverter {
                 })?;
             match operand.descriptor.data_type {
                 DataType::Uint8 | DataType::Int8 => {
-                    let data = Self::get_constant_data(graph, input_id)?;
+                    let data = Self::get_constant_data(graph, input_id, resolver)?;
                     let shape: Vec<i64> = operand
                         .descriptor
                         .shape
@@ -4567,10 +4593,11 @@ impl TrtxConverter {
     /// Formula: y = (x - mean) / sqrt(variance + epsilon) * scale + bias
     /// Computed over specified axes (typically last dimensions)
     fn add_layer_normalization_op<'a>(
-        graph: &GraphInfo,
+        graph: &'a GraphInfo,
         network: &mut trtx::NetworkDefinition<'a>,
         tensor_map: &mut HashMap<u32, trtx::Tensor<'a>>,
         operation: &Operation,
+        resolver: &mut (impl WeightsContext<'a> + 'a),
     ) -> Result<(), GraphError> {
         // Layer normalization computes statistics over specified axes
         // Input operands: input, scale (optional), bias (optional)
@@ -4742,7 +4769,7 @@ impl TrtxConverter {
                         })?;
                 let bias_bc = if graph.constant_operand_ids_to_handles.contains_key(&bias_id) {
                     // Shuffle cannot change volume. Broadcast by creating a constant filled with the bias value.
-                    let bias_data = Self::get_constant_data(graph, bias_id)?;
+                    let bias_data = Self::get_constant_data(graph, bias_id, resolver)?;
                     let bias_broadcast_bytes: Vec<u8> = match input_operand.descriptor.data_type {
                         DataType::Float16 => {
                             let bits =
@@ -12165,13 +12192,6 @@ impl GraphConverter for TrtxConverter {
     }
 
     fn convert(&self, graph_info: &GraphInfo) -> Result<ConvertedGraph, GraphError> {
-        trtx::dynamically_load_tensorrt(None::<&str>).map_err(|e| {
-            GraphError::ConversionFailed {
-                format: "trtx".to_string(),
-                reason: e.to_string(),
-            }
-        })?;
-
         // TODO: TRTX converter does not support dynamic dimensions yet
         if graph_info.has_dynamic_dimensions() {
             return Err(GraphError::ConversionFailed {

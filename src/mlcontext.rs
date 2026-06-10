@@ -49,9 +49,20 @@ pub(crate) trait MLBackendContext<'context>: std::fmt::Debug + Send + Sync {
     ) -> Result<()>;
     fn create_constant_tensor(
         &mut self,
-        descriptor: &MLTensorDescriptor,
+        descriptor: &MLOperandDescriptor,
         input_data: &[u8],
-    ) -> Result<MLTensor>;
+    ) -> Result<MLTensor> {
+        let tensor_desc = MLTensorDescriptor::from_operand_descriptor(descriptor);
+        let mut tensor = self.create_tensor(&tensor_desc)?;
+        tensor.constant = true;
+        self.write_tensor(&tensor, input_data).map_err(|e| {
+            crate::error::Error::TensorCreationError {
+                source: e.into(),
+                descriptor: tensor_desc.clone(),
+            }
+        })?; // need to free tensor in case of error
+        Ok(tensor)
+    }
     /*async*/
     fn read_tensor(&mut self, tensor: &MLTensor, array: &mut [u8]) -> Result<()>;
     /*async*/

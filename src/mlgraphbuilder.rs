@@ -2186,11 +2186,11 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
             .insert(id as u32, format!("{id}"));
         graph.constant_operand_ids_to_handles.insert(
             id as u32,
-            crate::ConstantData {
+            crate::graph::ConstantReference::OwnedData(crate::ConstantData {
                 // TODO: can't do this cast because of mismatched alignment
                 data: bytemuck::cast_vec::<T, u8>(values),
                 label: None,
-            },
+            }),
         );
 
         Ok(MLOperand { id })
@@ -2230,10 +2230,10 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
             .insert(id as u32, format!("{id}"));
         graph.constant_operand_ids_to_handles.insert(
             id as u32,
-            crate::ConstantData {
+            crate::graph::ConstantReference::OwnedData(crate::ConstantData {
                 data: bytemuck::cast_slice::<T, u8>(values).to_vec(),
                 label: None,
-            },
+            }),
         );
 
         Ok(MLOperand { id })

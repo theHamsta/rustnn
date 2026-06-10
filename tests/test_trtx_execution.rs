@@ -1329,10 +1329,10 @@ mod tests {
         let mut constant_map = HashMap::new();
         constant_map.insert(
             1,
-            ConstantData {
+            rustnn::graph::ConstantReference::OwnedData(ConstantData {
                 data: filter_bytes,
                 label: Some("filter".to_string()),
-            },
+            }),
         );
 
         let mut input_operands = vec![0, 1]; // input and filter
@@ -1361,10 +1361,10 @@ mod tests {
 
             constant_map.insert(
                 2,
-                ConstantData {
+                rustnn::graph::ConstantReference::OwnedData(ConstantData {
                     data: bias_bytes,
                     label: Some("bias".to_string()),
-                },
+                }),
             );
 
             operands.push(Operand {
@@ -1518,10 +1518,10 @@ mod tests {
         let mut constants = HashMap::new();
         constants.insert(
             1,
-            ConstantData {
+            rustnn::graph::ConstantReference::OwnedData(ConstantData {
                 data: slope_bytes,
                 label: None,
-            },
+            }),
         );
 
         let graph = GraphInfo {
@@ -3679,17 +3679,17 @@ mod tests {
         let mut constant_map = HashMap::new();
         constant_map.insert(
             1,
-            ConstantData {
+            rustnn::graph::ConstantReference::OwnedData(ConstantData {
                 data: kernel_bytes,
                 label: Some("kernel".to_string()),
-            },
+            }),
         );
         constant_map.insert(
             2,
-            ConstantData {
+            rustnn::graph::ConstantReference::OwnedData(ConstantData {
                 data: bias_bytes,
                 label: Some("bias".to_string()),
-            },
+            }),
         );
 
         let mut attributes = serde_json::Map::new();
@@ -4581,10 +4581,10 @@ mod tests {
         let mut constant_map = HashMap::new();
         constant_map.insert(
             1,
-            ConstantData {
+            rustnn::graph::ConstantReference::OwnedData(ConstantData {
                 data: filter_bytes,
                 label: Some("filter".to_string()),
-            },
+            }),
         );
 
         let mut input_operands = vec![0, 1]; // input and filter
@@ -4613,10 +4613,10 @@ mod tests {
 
             constant_map.insert(
                 2,
-                ConstantData {
+                rustnn::graph::ConstantReference::OwnedData(ConstantData {
                     data: bias_bytes,
                     label: Some("bias".to_string()),
-                },
+                }),
             );
 
             operands.push(Operand {

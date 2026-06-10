@@ -26,6 +26,7 @@ use crate::converters::TrtxConverter;
 use crate::error::Error;
 
 use crate::error::GraphBuilderError;
+use crate::graph::WeightsContext;
 use crate::mlcontext::MLTensor;
 use crate::mlcontext::{ListDevices, MLOperand};
 use crate::mlcontext::{MLBackendBuilder, MLGraph};
@@ -244,6 +245,25 @@ static TRTX_SUFFIX: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+pub struct TrtxZeroedWeights {}
+
+impl<'context> WeightsContext<'context> for TrtxZeroedWeights {
+    fn resolve(
+        &mut self,
+        _constant_ref: &'context crate::graph::ConstantReference,
+        descriptor: &crate::OperandDescriptor,
+        id: u32,
+    ) -> crate::error::Result<&'context [u8]> {
+        let bytes_len = descriptor.byte_length().ok_or_else(|| {
+            GraphBuilderError::RequestedConstantDataForDynamicallyShapedConstant {
+                id,
+                desc: descriptor.clone(),
+            }
+        })?;
+        crate::graph::get_zeroed_memory(id as usize * 32 * 4, bytes_len)
+    }
+}
+
 impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for TrtxBuilder<'context> {
     /*async */
     fn build(
@@ -273,7 +293,11 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for TrtxBuilder<'c
                 .unwrap()
                 .take()
                 .expect("Frontend API should prevent TrtxBuilder::build to be called twice");
-            crate::converters::TrtxConverter::build_network(&graph, &mut network)?;
+            crate::converters::TrtxConverter::build_network_with_weight_context(
+                &graph,
+                &mut network,
+                &mut TrtxZeroedWeights {},
+            )?;
             for constant_id in graph.constant_operand_ids_to_handles.keys() {
                 network.mark_weights_refittable(&format!("{constant_id}"))?;
             }
@@ -307,7 +331,7 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for TrtxBuilder<'c
         // TODO: wrap_err, when this fails usually the engine was built without kREFIT flag
         let mut refitter = Refitter::new(&engine, &LOGGER)?;
 
-        for (id, constant) in graph.constant_operand_ids_to_handles.iter() {
+        for id in graph.constant_operand_ids_to_handles.keys() {
             let operand = graph.operands.get(*id as usize);
             if let Some(operand) = operand.as_ref() {
                 let trt_type = TrtxConverter::webnn_to_trt_dtype(operand.descriptor.data_type)?;
@@ -321,11 +345,12 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for TrtxBuilder<'c
                     )
                 })?;
                 let expected_bytes = element_count * trt_type.size_bits() / 8;
-                if constant.data.len() != expected_bytes {
+                let constant_slice = graph.constant_data(*id)?;
+                if graph.constant_data(*id)?.len() != expected_bytes {
                     return Err(GraphBuilderError::InconsistentGraphInfo {
                         message: format!(
                             "Weight size mismatch: expected {expected_bytes} bytes, got {} bytes",
-                            constant.data.len()
+                            constant_slice.len()
                         ),
                     }
                     .into());
@@ -337,7 +362,7 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for TrtxBuilder<'c
                         &weight_name, // TODO: add API to name weights to trtx
                         trtx::trtx_sys::Weights {
                             type_: trt_type.into(),
-                            values: constant.data.as_ptr() as *const std::ffi::c_void,
+                            values: constant_slice.as_ptr() as *const std::ffi::c_void,
                             count: element_count as i64,
                         },
                         // TODO: register and upload during build, refit with device location
@@ -432,22 +457,6 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
             constant: false,
             descriptor: descriptor.clone(),
         })
-    }
-
-    fn create_constant_tensor(
-        &mut self,
-        descriptor: &crate::mlcontext::MLTensorDescriptor,
-        input_data: &[u8],
-    ) -> crate::error::Result<crate::mlcontext::MLTensor> {
-        let mut tensor = self.create_tensor(descriptor)?;
-        tensor.constant = true;
-        self.write_tensor(&tensor, input_data).map_err(|e| {
-            crate::error::Error::TensorCreationError {
-                source: e.into(),
-                descriptor: descriptor.clone(),
-            }
-        })?; // need to free tensor in case of error
-        Ok(tensor)
     }
 
     fn read_tensor(

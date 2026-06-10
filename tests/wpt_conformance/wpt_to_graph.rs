@@ -398,7 +398,7 @@ fn tensor_spec_to_bytes(spec: &WptTensorSpec) -> Result<Vec<u8>, String> {
 pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<String>), String> {
     let mut operands: Vec<Operand> = Vec::new();
     let mut name_to_id: HashMap<String, u32> = HashMap::new();
-    let mut constant_data: HashMap<u32, ConstantData> = HashMap::new();
+    let mut constant_data = HashMap::new();
     let mut input_operand_ids: Vec<u32> = Vec::new();
     let mut operations: Vec<Operation> = Vec::new();
 
@@ -411,10 +411,10 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
             let bytes = tensor_spec_to_bytes(spec)?;
             constant_data.insert(
                 next_id,
-                ConstantData {
+                rustnn::graph::ConstantReference::OwnedData(ConstantData {
                     data: bytes,
                     label: None,
-                },
+                }),
             );
             OperandKind::Constant
         } else {
@@ -679,10 +679,10 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
                         };
                         constant_data.insert(
                             next_id,
-                            ConstantData {
+                            rustnn::graph::ConstantReference::OwnedData(ConstantData {
                                 data: scale_bytes,
                                 label: None,
-                            },
+                            }),
                         );
                         operands.push(Operand {
                             kind: OperandKind::Constant,
@@ -714,10 +714,10 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
                         };
                         constant_data.insert(
                             next_id,
-                            ConstantData {
+                            rustnn::graph::ConstantReference::OwnedData(ConstantData {
                                 data: bias_bytes,
                                 label: None,
-                            },
+                            }),
                         );
                         operands.push(Operand {
                             kind: OperandKind::Constant,
@@ -783,10 +783,10 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
                     };
                     constant_data.insert(
                         next_id,
-                        ConstantData {
+                        rustnn::graph::ConstantReference::OwnedData(ConstantData {
                             data: scale_bytes,
                             label: None,
-                        },
+                        }),
                     );
                     operands.push(Operand {
                         kind: OperandKind::Constant,
@@ -812,10 +812,10 @@ pub fn wpt_graph_to_graph_info(graph: &WptGraph) -> Result<(GraphInfo, Vec<Strin
                     };
                     constant_data.insert(
                         next_id,
-                        ConstantData {
+                        rustnn::graph::ConstantReference::OwnedData(ConstantData {
                             data: bias_bytes,
                             label: None,
-                        },
+                        }),
                     );
                     operands.push(Operand {
                         kind: OperandKind::Constant,
