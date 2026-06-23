@@ -296,8 +296,8 @@ pub struct MLOpSupportLimits {}
 // https://www.w3.org/TR/webnn/#dictdef-mloperanddescriptor
 #[derive(Debug, Eq, PartialEq, Default, Clone)]
 pub struct MLOperandDescriptor {
-    data_type: MLOperandDataType,
-    shape: Vec<u64>, // TODO: this is u64 instead of WebNN's u32. u32 is screaming for problems on desktop
+    pub(crate) data_type: MLOperandDataType,
+    pub(crate) shape: Vec<u64>, // TODO: this is u64 instead of WebNN's u32. u32 is screaming for problems on desktop
 }
 
 impl From<&MLOperandDescriptor> for OperandDescriptor {

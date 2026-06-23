@@ -2239,12 +2239,18 @@ impl<'context, 'builder> MLGraphBuilder<'context, 'builder> {
         Ok(MLOperand { id })
     }
 
-    pub fn constant_from_value<T>(
+    pub fn constant_from_scalar<T: bytemuck::NoUninit>(
         &mut self,
-        _data_type: MLOperandDataType,
-        _value: T,
+        data_type: MLOperandDataType,
+        scalar: T,
     ) -> crate::error::Result<MLOperand> {
-        todo!()
+        self.constant_from_slice(
+            &MLOperandDescriptor {
+                data_type,
+                shape: vec![],
+            },
+            &[scalar],
+        )
     }
 
     // internal methods
@@ -3161,6 +3167,42 @@ mod test {
         context.dispatch(&mut graph2, &inputs, &outputs).unwrap();
         context.read_tensor(&output, &mut output_cpu).unwrap();
         assert_eq!(output_cpu, &[4.0f32, 5., 6., 7.]);
+    }
+
+    #[test]
+    fn test_scalar_constants() {
+        let _ = pretty_env_logger::try_init();
+        let context = MLContext::create(&MLContextOptions::new(MLPowerPreference::Default, true));
+        if matches!(context, Err(crate::error::Error::NoBackendAvialable)) {
+            return;
+        }
+
+        let mut context = context.unwrap();
+        let mut builder = MLGraphBuilder::new(&mut context).unwrap();
+        let a = builder
+            .constant_from_scalar(crate::operator_enums::MLOperandDataType::Float32, 1.0f32)
+            .unwrap();
+        let b = builder
+            .constant_from_scalar(crate::operator_enums::MLOperandDataType::Float32, 2.0f32)
+            .unwrap();
+
+        let out = builder.add(a, b).unwrap();
+        let mut outputs = HashMap::new();
+        outputs.insert("out", out);
+        let mut graph = builder.build(&outputs).unwrap();
+
+        let mut desc =
+            MLTensorDescriptor::new(crate::operator_enums::MLOperandDataType::Float32, vec![]);
+        desc.set_readable(true);
+        let output = context.create_tensor(&desc).unwrap();
+        let inputs = HashMap::new();
+        let mut outputs = HashMap::new();
+        outputs.insert("out", &output);
+        context.dispatch(&mut graph, &inputs, &outputs).unwrap();
+        let mut output_data = vec![42.0f32];
+        context.read_tensor(&output, &mut output_data).unwrap();
+
+        assert_eq!(output_data[0], 3.0f32);
     }
 
     #[test]
