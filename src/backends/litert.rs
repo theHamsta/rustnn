@@ -98,21 +98,6 @@ impl<'context> MLBackendContext<'context> for LiteRtContext {
         todo!("Not Implemented yet.")
     }
 
-    fn create_constant_tensor(
-        &mut self,
-        descriptor: &MLTensorDescriptor,
-        input_data: &[u8],
-    ) -> Result<MLTensor> {
-        let mut tensor = self.create_tensor(descriptor)?;
-        tensor.constant = true;
-        self.write_tensor(&tensor, input_data)
-            .map_err(|e| Error::TensorCreationError {
-                source: e.into(),
-                descriptor: descriptor.clone(),
-            })?;
-        Ok(tensor)
-    }
-
     fn read_tensor(&mut self, tensor: &MLTensor, array: &mut [u8]) -> Result<()> {
         let host = &self.tensors[tensor.id].memory;
         let logical = tensor_byte_len(tensor.descriptor())?;

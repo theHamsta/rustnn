@@ -78,6 +78,10 @@ pub(crate) trait MLBackendContext<'context>: std::fmt::Debug + Send + Sync {
 pub(crate) trait MLBackendBuilder<'context, 'builder>: std::fmt::Debug + Send {
     /*async*/
     fn build(&mut self, graph: GraphInfo) -> Result<MLGraph<'context>>;
+
+    fn register_constant(&mut self, graph: &mut GraphInfo, new_id: u32) -> Result<()> {
+        Ok(())
+    }
 }
 
 // can be made a Box<dyn better_any::Tid<'context> + 'context> for dynamic dispatch

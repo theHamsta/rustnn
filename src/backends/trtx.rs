@@ -3,9 +3,11 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ops::Deref;
 use std::sync::LazyLock;
+use std::sync::RwLock;
 
 use cudarc::driver::CudaSlice;
 use cudarc::driver::CudaStream;
+use cudarc::driver::DevicePtr;
 use cudarc::driver::{CudaContext, DriverError, result, sys};
 use cudarc::driver::{CudaEvent, DevicePtrMut};
 use log::debug;
@@ -170,7 +172,7 @@ impl TrtxTensor {
 
 pub(crate) struct TrtxContext<'context> {
     cuda_ctx: Arc<CudaContext>,
-    tensors: Vec<TrtxTensor>,
+    tensors: Arc<RwLock<Vec<TrtxTensor>>>,
     events: Vec<CudaEvent>,
     runtime: Arc<Mutex<trtx::Runtime<'context>>>,
     config: Arc<Mutex<trtx::BuilderConfig<'context>>>, // needs to be destroyed before builder
@@ -207,7 +209,7 @@ impl<'context> TrtxContext<'context> {
         debug!("Created new TrtxContext");
         Ok(Self {
             cuda_ctx,
-            tensors: vec![],
+            tensors: Default::default(),
             events: vec![],
             runtime,
             builder: Arc::new(builder.into()),
@@ -224,7 +226,7 @@ pub(crate) struct TrtxBuilder<'builder> {
     cuda_context: Arc<CudaContext>,
     runtime: Arc<Mutex<trtx::Runtime<'builder>>>,
     operands: HashMap<String, MLOperand>,
-    strings: Vec<String>, //_parser: Option<OnnxParser<'builder>>,
+    tensors: Arc<RwLock<Vec<TrtxTensor>>>,
     caching_enabled: bool,
 }
 
@@ -345,34 +347,78 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for TrtxBuilder<'c
                     )
                 })?;
                 let expected_bytes = element_count * trt_type.size_bits() / 8;
-                let constant_slice = graph.constant_data(*id)?;
-                if graph.constant_data(*id)?.len() != expected_bytes {
-                    return Err(GraphBuilderError::InconsistentGraphInfo {
+                if let Ok(constant_slice) = graph.constant_data(*id) {
+                    if graph.constant_data(*id)?.len() != expected_bytes {
+                        return Err(GraphBuilderError::InconsistentGraphInfo {
                         message: format!(
                             "Weight size mismatch: expected {expected_bytes} bytes, got {} bytes",
                             constant_slice.len()
                         ),
                     }
                     .into());
+                    }
+                    let weight_name = format!("{id}");
+                    trace!("Trying to refit weight {weight_name}");
+                    unsafe {
+                        refitter.set_named_weights_with_location(
+                            &weight_name, // TODO: add API to name weights to trtx
+                            trtx::trtx_sys::Weights {
+                                type_: trt_type.into(),
+                                values: constant_slice.as_ptr() as *const std::ffi::c_void,
+                                count: element_count as i64,
+                            },
+                            // TODO: register and upload during build, refit with device location
+                            trtx::trtx_sys::nvinfer1::TensorLocation::kHOST,
+                        )?
+                    };
+                } else {
+                    let constant_ref = graph
+                        .constant_operand_ids_to_handles
+                        .get(id)
+                        .ok_or_else(|| {
+                            <GraphBuilderError as Into<crate::error::Error>>::into(GraphBuilderError::InconsistentGraphInfo {
+                                message: format!(
+                                             "Inconsistent GraphInfo: Could not resolve ConstantReference for id {id}"
+                                         ),
+                            })
+                        })?;
+                    let id_ref = constant_ref.as_id_ref().ok_or_else(||
+                            <GraphBuilderError as Into<crate::error::Error>>::into(GraphBuilderError::InconsistentGraphInfo {
+                                message: format!(
+                                             "ConstantReference {constant_ref:?} was not owned data and also not a IdRef for a constant tensor"
+                                         ),
+                            })
+                        )?;
+
+                    let lock = self.tensors.read().unwrap();
+
+                    let tensor = lock.get(id_ref.id as usize).ok_or_else(|| {
+                        <GraphBuilderError as Into<crate::error::Error>>::into(
+                            GraphBuilderError::InconsistentGraphInfo {
+                                message: format!("Invalid tensor reference {id_ref:?}"),
+                            },
+                        )
+                    })?;
+
+                    let weight_name = format!("{id}");
+                    trace!("Trying to refit weight {weight_name}");
+                    unsafe {
+                        refitter.set_named_weights_with_location(
+                            &weight_name, // TODO: add API to name weights to trtx
+                            trtx::trtx_sys::Weights {
+                                type_: trt_type.into(),
+                                values: tensor.memory.device_ptr(&tensor.stream).0
+                                    as *const std::ffi::c_void,
+                                count: element_count as i64,
+                            },
+                            trtx::trtx_sys::nvinfer1::TensorLocation::kDEVICE,
+                        )?
+                    };
                 }
-                let weight_name = format!("{id}");
-                trace!("Trying to refit weight {weight_name}");
-                unsafe {
-                    refitter.set_named_weights_with_location(
-                        &weight_name, // TODO: add API to name weights to trtx
-                        trtx::trtx_sys::Weights {
-                            type_: trt_type.into(),
-                            values: constant_slice.as_ptr() as *const std::ffi::c_void,
-                            count: element_count as i64,
-                        },
-                        // TODO: register and upload during build, refit with device location
-                        trtx::trtx_sys::nvinfer1::TensorLocation::kHOST,
-                    )?
-                };
             } else {
                 return Err(GraphBuilderError::InconsistentGraphInfo {
                     message: format!(
-                        "Inconsistent GraphInfo: Constant operation with {id} is missing operations"
+                        "Inconsistent GraphInfo: Constant operation with id {id} is missing operations"
                     ),
                 }
                 .into());
@@ -422,7 +468,9 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
                 })?,
         )
         .into();
-        //self.networks.push(network);
+
+        let tensors = Arc::clone(&self.tensors);
+
         Ok(Box::new(TrtxBuilder {
             network,
             builder: Arc::clone(&self.builder),
@@ -430,7 +478,7 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
             runtime: Arc::clone(&self.runtime),
             cuda_context: Arc::clone(&self.cuda_ctx),
             operands: HashMap::new(),
-            strings: vec![],
+            tensors,
             // disabled for now, since feature experimental.
             // can be enabled with more test coverage, but will remain a double-sided sword
             // e.g. if you change trtx converter, changes might not be visible, since cache skips conversion
@@ -451,9 +499,10 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
                 descriptor: descriptor.clone(),
             }
         })?;
-        self.tensors.push(tensor);
+        let mut lock = self.tensors.write().unwrap();
+        lock.push(tensor);
         Ok(MLTensor {
-            id: self.tensors.len() - 1,
+            id: lock.len() - 1,
             constant: false,
             descriptor: descriptor.clone(),
         })
@@ -464,7 +513,7 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
         tensor: &crate::mlcontext::MLTensor,
         array: &mut [u8],
     ) -> crate::error::Result<()> {
-        let cuda_tensor = &self.tensors[tensor.id];
+        let cuda_tensor = &self.tensors.read().unwrap()[tensor.id];
         let stream = &cuda_tensor.stream;
         debug!(
             "Downloading tensor {cuda_tensor:?} to array (ptr={:?}, size={:?})",
@@ -485,7 +534,7 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
         tensor: &crate::mlcontext::MLTensor,
         array: &[u8],
     ) -> crate::error::Result<()> {
-        let cuda_tensor = &mut self.tensors[tensor.id];
+        let cuda_tensor = &mut self.tensors.write().unwrap()[tensor.id];
         let stream = &cuda_tensor.stream;
         debug!(
             "Uploading tensor {cuda_tensor:?} to array (ptr={:?}, size={:?})",
@@ -514,7 +563,7 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
         // TODO: set shape for dynamic networks and validate shape of input/output
         // tensors with what the network expect (done automatically by setting io_shapes?)
         for (input, tensor) in inputs.iter() {
-            let cuda_tensor = &mut self.tensors[tensor.id];
+            let cuda_tensor = &mut self.tensors.write().unwrap()[tensor.id];
 
             let (ptr, _) = cuda_tensor.memory.device_ptr_mut(&cuda_tensor.stream);
             unsafe {
@@ -528,7 +577,7 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
             self.events.push(event);
         }
         for (output, tensor) in outputs.iter() {
-            let cuda_tensor = &mut self.tensors[tensor.id];
+            let cuda_tensor = &mut self.tensors.write().unwrap()[tensor.id];
 
             let (ptr, _) = cuda_tensor.memory.device_ptr_mut(&cuda_tensor.stream);
             unsafe {
@@ -547,7 +596,7 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
         };
         let inference_done = inference_stream.record_event(None).to_dispatch_result()?;
         for tensor in outputs.values() {
-            let cuda_tensor = &mut self.tensors[tensor.id];
+            let cuda_tensor = &mut self.tensors.write().unwrap()[tensor.id];
             cuda_tensor
                 .stream
                 .wait(&inference_done)
@@ -567,7 +616,7 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
         new_desc.set_shape(new_shape.to_vec());
 
         let new_bytes = new_desc.rustnn_required_bytes();
-        let cuda_tensor = &mut self.tensors[tensor.id];
+        let cuda_tensor = &mut self.tensors.write().unwrap()[tensor.id];
         debug!(
             "Resizing tensor {cuda_tensor:?} old desc: {:?}, new shape {new_shape:?}, new bytes {new_bytes}",
             tensor.descriptor.shape()
@@ -599,7 +648,7 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
             });
         }
 
-        let cuda_tensor = &mut self.tensors[tensor.id];
+        let cuda_tensor = &mut self.tensors.write().unwrap()[tensor.id];
         cuda_tensor.memory = unsafe { cuda_tensor.stream.alloc(new_bytes)? };
         Ok(())
     }

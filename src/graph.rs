@@ -630,6 +630,22 @@ impl ConstantReference {
     pub fn is_zeroed_unique_ptr(&self) -> bool {
         matches!(self, Self::ZeroedUniquePtr { .. })
     }
+
+    pub fn as_id_ref(&self) -> Option<&IdRef> {
+        if let Self::IdRef(v) = self {
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    /// Returns `true` if the constant reference is [`IdRef`].
+    ///
+    /// [`IdRef`]: ConstantReference::IdRef
+    #[must_use]
+    pub fn is_id_ref(&self) -> bool {
+        matches!(self, Self::IdRef(..))
+    }
 }
 
 #[derive(Debug, Serialize, Clone, Deserialize, Default)]
@@ -661,6 +677,30 @@ impl GraphInfo {
             .ok_or(crate::error::GraphBuilderError::MissingConstantId { id })?
             .descriptor;
         DefaultWeightsContext {}.resolve(constant, descriptor, id)
+    }
+
+    pub fn add_constant_reference(
+        &mut self,
+        descriptor: OperandDescriptor,
+        reference: ConstantReference,
+        name: Option<String>,
+    ) -> crate::error::Result<u32> {
+        let id = self
+            .operands
+            .len()
+            .try_into()
+            .map_err(|_e| GraphError::TooManyOperands {
+                count: self.operands.len(),
+            })?;
+
+        self.operands.push(Operand {
+            kind: OperandKind::Constant,
+            descriptor,
+            name,
+        });
+        self.constant_operand_ids_to_handles.insert(id, reference);
+
+        Ok(id)
     }
 
     pub fn resolve_constant<'context>(
