@@ -722,14 +722,6 @@ impl<'context> MLContext<'context> {
     ) -> Result<()> {
         self.backend.rustnn_set_tensor_capacity(tensor, max_shape)
     }
-
-    pub fn set_rustnn_options(&mut self, optons: RustNNOptions) {
-        self.rustnn_options = optons;
-    }
-
-    pub fn rustnn_options(&self) -> &RustNNOptions {
-        &self.rustnn_options
-    }
 }
 
 #[cfg(test)]

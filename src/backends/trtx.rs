@@ -709,7 +709,7 @@ impl ListDevices for TrtxContext<'_> {
 #[cfg(test)]
 #[cfg(feature = "trtx-runtime")]
 mod tests {
-    use crate::mlcontext::{MLBackendContext, MLTensorDescriptor};
+    use crate::mlcontext::{MLBackendContext, MLTensorDescriptor, TrtxOptions};
     use crate::{backends::trtx::TrtxContext, mlcontext::ListDevices};
 
     #[test]
@@ -718,7 +718,7 @@ mod tests {
         use crate::{backends::trtx::TrtxContext, mlcontext::ListDevices};
         let devices = TrtxContext::list_devices();
         let context = if let [first, ..] = devices.as_slice() {
-            TrtxContext::new(*first.as_trtx_device().unwrap()).unwrap()
+            TrtxContext::new(*first.as_trtx_device().unwrap(), &TrtxOptions::default()).unwrap()
         } else {
             return;
         };
@@ -731,7 +731,7 @@ mod tests {
         let _ = pretty_env_logger::try_init();
         let devices = TrtxContext::list_devices();
         let mut context = if let [first, ..] = devices.as_slice() {
-            TrtxContext::new(*first.as_trtx_device().unwrap()).unwrap()
+            TrtxContext::new(*first.as_trtx_device().unwrap(), &TrtxOptions::default()).unwrap()
         } else {
             return;
         };
@@ -744,7 +744,7 @@ mod tests {
         let _ = pretty_env_logger::try_init();
         let devices = TrtxContext::list_devices();
         let mut context = if let [first, ..] = devices.as_slice() {
-            TrtxContext::new(*first.as_trtx_device().unwrap()).unwrap()
+            TrtxContext::new(*first.as_trtx_device().unwrap(), &TrtxOptions::default()).unwrap()
         } else {
             return;
         };
@@ -774,7 +774,7 @@ mod tests {
         let _ = pretty_env_logger::try_init();
         let devices = TrtxContext::list_devices();
         let mut context = if let [first, ..] = devices.as_slice() {
-            TrtxContext::new(*first.as_trtx_device().unwrap()).unwrap()
+            TrtxContext::new(*first.as_trtx_device().unwrap(), &TrtxOptions::default()).unwrap()
         } else {
             return;
         };
