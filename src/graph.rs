@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
@@ -776,10 +776,28 @@ impl GraphInfo {
         ),
         GraphError,
     > {
+        self.io_binding_maps_excluding(&HashSet::new())
+    }
+
+    /// Like [`Self::io_binding_maps`], but omits graph inputs whose operand ids are in `exclude`.
+    #[allow(clippy::type_complexity)]
+    pub fn io_binding_maps_excluding(
+        &self,
+        exclude_input_operand_ids: &HashSet<u32>,
+    ) -> Result<
+        (
+            HashMap<String, OperandDescriptor>,
+            HashMap<String, OperandDescriptor>,
+        ),
+        GraphError,
+    > {
         self.validate_io_operand_lists()?;
 
         let mut inputs = HashMap::new();
         for &id in &self.input_operands {
+            if exclude_input_operand_ids.contains(&id) {
+                continue;
+            }
             let operand = self.operand(id).expect("validated above");
             let name = operand
                 .name

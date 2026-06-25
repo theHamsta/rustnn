@@ -211,8 +211,16 @@ pub struct MLGraph<'context> {
 
 impl<'context> MLGraph<'context> {
     pub(crate) fn new(backend: MLBackendGraph<'context>, graph_info: &GraphInfo) -> Result<Self> {
+        Self::new_excluding_inputs(backend, graph_info, &std::collections::HashSet::new())
+    }
+
+    pub(crate) fn new_excluding_inputs(
+        backend: MLBackendGraph<'context>,
+        graph_info: &GraphInfo,
+        exclude_input_operand_ids: &std::collections::HashSet<u32>,
+    ) -> Result<Self> {
         let (input_descriptors, output_descriptors) = graph_info
-            .io_binding_maps()
+            .io_binding_maps_excluding(exclude_input_operand_ids)
             .map_err(|e| Error::GraphBuildError { source: e.into() })?;
         Ok(Self {
             backend,
@@ -375,7 +383,7 @@ impl Default for TrtxOptions {
             // maybe the build hash of certain trtx related files could be included in hash
             engine_caching: false,
             // potential way to save VRAM, would also require weight transforms
-            weights_as_inputs: false,
+            weights_as_inputs: true,
         }
     }
 }

@@ -58,7 +58,7 @@ impl TrtxConverter {
     }
 
     /// TensorRT weight name for graph [`OperandKind::Constant`] operands (operand index).
-    fn constant_weight_name(operand_id: u32) -> String {
+    pub(crate) fn constant_weight_name(operand_id: u32) -> String {
         format!("{operand_id}")
     }
 

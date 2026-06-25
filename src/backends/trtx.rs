@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ops::Deref;
 use std::sync::LazyLock;
@@ -28,6 +28,7 @@ use crate::converters::TrtxConverter;
 use crate::error::Error;
 
 use crate::error::GraphBuilderError;
+use crate::graph::OperandKind;
 use crate::graph::WeightsContext;
 use crate::mlcontext::MLTensor;
 use crate::mlcontext::TrtxOptions;
@@ -169,6 +170,15 @@ impl TrtxTensor {
         let memory = stream.alloc_zeros(size)?;
         Ok(Self { memory, stream })
     }
+
+    fn from_host_bytes(cuda_ctx: &Arc<CudaContext>, data: &[u8]) -> TrtxResult<Self> {
+        let mut tensor = Self::new(cuda_ctx, data.len())?;
+        tensor
+            .stream
+            .memcpy_htod(data, &mut tensor.memory)
+            .map_err(TrtxError::from)?;
+        Ok(tensor)
+    }
 }
 
 pub(crate) struct TrtxContext<'context> {
@@ -232,6 +242,8 @@ pub(crate) struct TrtxBuilder<'builder> {
     tensors: Arc<RwLock<Vec<TrtxTensor>>>,
     caching_enabled: bool,
     weights_as_inputs: bool,
+    /// Operand id of promoted weight inputs -> backend tensor id.
+    weight_input_tensors: HashMap<u32, usize>,
 }
 
 impl std::fmt::Debug for TrtxBuilder<'_> {
@@ -270,7 +282,133 @@ impl<'context> WeightsContext<'context> for TrtxZeroedWeights {
     }
 }
 
+fn bind_weight_input_tensors(
+    exec: &mut ExecutionContext<'_>,
+    graph: &GraphInfo,
+    weight_input_tensors: &HashMap<u32, usize>,
+    tensors: &RwLock<Vec<TrtxTensor>>,
+    inference_stream: &CudaStream,
+) -> crate::error::Result<()> {
+    let tensors_guard = tensors.read().unwrap();
+    for (&operand_id, &tensor_id) in weight_input_tensors {
+        let binding_name = TrtxConverter::engine_io_tensor_name(graph, operand_id);
+        let cuda_tensor = tensors_guard.get(tensor_id).ok_or_else(|| {
+            Error::GraphBuilderError {
+                source: GraphBuilderError::InconsistentGraphInfo {
+                    message: format!(
+                        "Weight input tensor id {tensor_id} for operand {operand_id} is missing"
+                    ),
+                },
+            }
+        })?;
+        let event = cuda_tensor
+            .stream
+            .record_event(None)
+            .map_err(|e| Error::GraphBuildError { source: e.into() })?;
+        inference_stream
+            .wait(&event)
+            .map_err(|e| Error::GraphBuildError { source: e.into() })?;
+        let (ptr, _) = cuda_tensor.memory.device_ptr(&cuda_tensor.stream);
+        trace!("Binding weight input {binding_name} from tensor {tensor_id}");
+        unsafe {
+            exec.set_input_tensor_address(binding_name.as_str(), ptr as *mut c_void)
+                .to_dispatch_result()?;
+        }
+    }
+    Ok(())
+}
+
+impl TrtxBuilder<'_> {
+    fn promote_constant_to_weight_input(
+        &mut self,
+        graph: &mut GraphInfo,
+        new_id: u32,
+    ) -> crate::error::Result<()> {
+        let constant_ref = graph
+            .constant_operand_ids_to_handles
+            .remove(&new_id)
+            .ok_or(GraphBuilderError::MissingConstantId { id: new_id })?;
+
+        let descriptor = graph
+            .operands
+            .get(new_id as usize)
+            .ok_or(GraphBuilderError::MissingConstantId { id: new_id })?
+            .descriptor
+            .clone();
+        let byte_len = descriptor.byte_length().ok_or_else(|| {
+            GraphBuilderError::RequestedConstantDataForDynamicallyShapedConstant {
+                id: new_id,
+                desc: descriptor.clone(),
+            }
+        })?;
+
+        let tensor_id = match &constant_ref {
+            crate::graph::ConstantReference::IdRef(id_ref) => {
+                let lock = self.tensors.read().unwrap();
+                if lock.get(id_ref.id as usize).is_none() {
+                    return Err(GraphBuilderError::InconsistentGraphInfo {
+                        message: format!("Invalid tensor reference {id_ref:?}"),
+                    }
+                    .into());
+                }
+                id_ref.id as usize
+            }
+            crate::graph::ConstantReference::OwnedData(data) => {
+                if data.data.len() != byte_len {
+                    return Err(GraphBuilderError::InconsistentGraphInfo {
+                        message: format!(
+                            "Weight size mismatch for operand {new_id}: expected {byte_len} bytes, got {} bytes",
+                            data.data.len()
+                        ),
+                    }
+                    .into());
+                }
+                let tensor = TrtxTensor::from_host_bytes(&self.cuda_context, &data.data)
+                    .map_err(|e| Error::GraphBuildError { source: e.into() })?;
+                let mut lock = self.tensors.write().unwrap();
+                lock.push(tensor);
+                lock.len() - 1
+            }
+            crate::graph::ConstantReference::Zeroed
+            | crate::graph::ConstantReference::ZeroedUniquePtr { .. }
+            | crate::graph::ConstantReference::Missing
+            | crate::graph::ConstantReference::UrlRef(_)
+            | crate::graph::ConstantReference::FileRef(_)
+            | crate::graph::ConstantReference::OffsetRef(_)
+            | crate::graph::ConstantReference::StringRef(_) => {
+                return Err(GraphBuilderError::InconsistentGraphInfo {
+                    message: format!(
+                        "weights_as_inputs does not support constant reference {constant_ref:?} for operand {new_id}"
+                    ),
+                }
+                .into());
+            }
+        };
+
+        self.weight_input_tensors.insert(new_id, tensor_id);
+
+        let operand = &mut graph.operands[new_id as usize];
+        operand.kind = OperandKind::Input;
+        operand.name = Some(TrtxConverter::constant_weight_name(new_id));
+        graph.input_operands.push(new_id);
+        graph.input_operands.sort_unstable();
+
+        Ok(())
+    }
+}
+
 impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for TrtxBuilder<'context> {
+    fn register_constant(
+        &mut self,
+        graph: &mut GraphInfo,
+        new_id: u32,
+    ) -> crate::error::Result<()> {
+        if self.weights_as_inputs {
+            self.promote_constant_to_weight_input(graph, new_id)?;
+        }
+        Ok(())
+    }
+
     /*async */
     fn build(
         &mut self,
@@ -335,115 +473,132 @@ impl<'context, 'builder> MLBackendBuilder<'context, 'builder> for TrtxBuilder<'c
             .map_err(|e| crate::error::Error::GraphBuildError { source: e.into() })?;
 
         // TODO: wrap_err, when this fails usually the engine was built without kREFIT flag
-        let mut refitter = Refitter::new(&engine, &LOGGER)?;
+        if !graph.constant_operand_ids_to_handles.is_empty() {
+            let mut refitter = Refitter::new(&engine, &LOGGER)?;
 
-        for id in graph.constant_operand_ids_to_handles.keys() {
-            let operand = graph.operands.get(*id as usize);
-            if let Some(operand) = operand.as_ref() {
-                let trt_type = TrtxConverter::webnn_to_trt_dtype(operand.descriptor.data_type)?;
-                let element_count = operand.descriptor.element_count().ok_or_else(|| {
-                    std::convert::Into::<crate::error::Error>::into(
-                        GraphBuilderError::InconsistentGraphInfo {
-                            message: format!(
-                                "Constant with dynamic size: id={id} operand={operand:#?}"
-                            ),
-                        },
-                    )
-                })?;
-                let expected_bytes = element_count * trt_type.size_bits() / 8;
-                if let Ok(constant_slice) = graph.constant_data(*id) {
-                    if graph.constant_data(*id)?.len() != expected_bytes {
-                        return Err(GraphBuilderError::InconsistentGraphInfo {
-                        message: format!(
-                            "Weight size mismatch: expected {expected_bytes} bytes, got {} bytes",
-                            constant_slice.len()
-                        ),
-                    }
-                    .into());
-                    }
-                    let weight_name = format!("{id}");
-                    trace!("Trying to refit weight {weight_name}");
-                    unsafe {
-                        refitter.set_named_weights_with_location(
-                            &weight_name, // TODO: add API to name weights to trtx
-                            trtx::trtx_sys::Weights {
-                                type_: trt_type.into(),
-                                values: constant_slice.as_ptr() as *const std::ffi::c_void,
-                                count: element_count as i64,
-                            },
-                            // TODO: register and upload during build, refit with device location
-                            trtx::trtx_sys::nvinfer1::TensorLocation::kHOST,
-                        )?
-                    };
-                } else {
-                    let constant_ref = graph
-                        .constant_operand_ids_to_handles
-                        .get(id)
-                        .ok_or_else(|| {
-                            <GraphBuilderError as Into<crate::error::Error>>::into(GraphBuilderError::InconsistentGraphInfo {
-                                message: format!(
-                                             "Inconsistent GraphInfo: Could not resolve ConstantReference for id {id}"
-                                         ),
-                            })
-                        })?;
-                    let id_ref = constant_ref.as_id_ref().ok_or_else(||
-                            <GraphBuilderError as Into<crate::error::Error>>::into(GraphBuilderError::InconsistentGraphInfo {
-                                message: format!(
-                                             "ConstantReference {constant_ref:?} was not owned data and also not a IdRef for a constant tensor"
-                                         ),
-                            })
-                        )?;
-
-                    let lock = self.tensors.read().unwrap();
-
-                    let tensor = lock.get(id_ref.id as usize).ok_or_else(|| {
-                        <GraphBuilderError as Into<crate::error::Error>>::into(
+            for id in graph.constant_operand_ids_to_handles.keys() {
+                let operand = graph.operands.get(*id as usize);
+                if let Some(operand) = operand.as_ref() {
+                    let trt_type = TrtxConverter::webnn_to_trt_dtype(operand.descriptor.data_type)?;
+                    let element_count = operand.descriptor.element_count().ok_or_else(|| {
+                        std::convert::Into::<crate::error::Error>::into(
                             GraphBuilderError::InconsistentGraphInfo {
-                                message: format!("Invalid tensor reference {id_ref:?}"),
+                                message: format!(
+                                    "Constant with dynamic size: id={id} operand={operand:#?}"
+                                ),
                             },
                         )
                     })?;
+                    let expected_bytes = element_count * trt_type.size_bits() / 8;
+                    if let Ok(constant_slice) = graph.constant_data(*id) {
+                        if graph.constant_data(*id)?.len() != expected_bytes {
+                            return Err(GraphBuilderError::InconsistentGraphInfo {
+                            message: format!(
+                                "Weight size mismatch: expected {expected_bytes} bytes, got {} bytes",
+                                constant_slice.len()
+                            ),
+                        }
+                        .into());
+                        }
+                        let weight_name = format!("{id}");
+                        trace!("Trying to refit weight {weight_name}");
+                        unsafe {
+                            refitter.set_named_weights_with_location(
+                                &weight_name, // TODO: add API to name weights to trtx
+                                trtx::trtx_sys::Weights {
+                                    type_: trt_type.into(),
+                                    values: constant_slice.as_ptr() as *const std::ffi::c_void,
+                                    count: element_count as i64,
+                                },
+                                // TODO: register and upload during build, refit with device location
+                                trtx::trtx_sys::nvinfer1::TensorLocation::kHOST,
+                            )?
+                        };
+                    } else {
+                        let constant_ref = graph
+                            .constant_operand_ids_to_handles
+                            .get(id)
+                            .ok_or_else(|| {
+                                <GraphBuilderError as Into<crate::error::Error>>::into(GraphBuilderError::InconsistentGraphInfo {
+                                    message: format!(
+                                                 "Inconsistent GraphInfo: Could not resolve ConstantReference for id {id}"
+                                             ),
+                                })
+                            })?;
+                        let id_ref = constant_ref.as_id_ref().ok_or_else(||
+                                <GraphBuilderError as Into<crate::error::Error>>::into(GraphBuilderError::InconsistentGraphInfo {
+                                    message: format!(
+                                                 "ConstantReference {constant_ref:?} was not owned data and also not a IdRef for a constant tensor"
+                                             ),
+                                })
+                            )?;
 
-                    let weight_name = format!("{id}");
-                    trace!("Trying to refit weight {weight_name}");
-                    unsafe {
-                        refitter.set_named_weights_with_location(
-                            &weight_name, // TODO: add API to name weights to trtx
-                            trtx::trtx_sys::Weights {
-                                type_: trt_type.into(),
-                                values: tensor.memory.device_ptr(&tensor.stream).0
-                                    as *const std::ffi::c_void,
-                                count: element_count as i64,
-                            },
-                            trtx::trtx_sys::nvinfer1::TensorLocation::kDEVICE,
-                        )?
-                    };
+                        let lock = self.tensors.read().unwrap();
+
+                        let tensor = lock.get(id_ref.id as usize).ok_or_else(|| {
+                            <GraphBuilderError as Into<crate::error::Error>>::into(
+                                GraphBuilderError::InconsistentGraphInfo {
+                                    message: format!("Invalid tensor reference {id_ref:?}"),
+                                },
+                            )
+                        })?;
+
+                        let weight_name = format!("{id}");
+                        trace!("Trying to refit weight {weight_name}");
+                        unsafe {
+                            refitter.set_named_weights_with_location(
+                                &weight_name, // TODO: add API to name weights to trtx
+                                trtx::trtx_sys::Weights {
+                                    type_: trt_type.into(),
+                                    values: tensor.memory.device_ptr(&tensor.stream).0
+                                        as *const std::ffi::c_void,
+                                    count: element_count as i64,
+                                },
+                                trtx::trtx_sys::nvinfer1::TensorLocation::kDEVICE,
+                            )?
+                        };
+                    }
+                } else {
+                    return Err(GraphBuilderError::InconsistentGraphInfo {
+                        message: format!(
+                            "Inconsistent GraphInfo: Constant operation with id {id} is missing operations"
+                        ),
+                    }
+                    .into());
                 }
-            } else {
-                return Err(GraphBuilderError::InconsistentGraphInfo {
-                    message: format!(
-                        "Inconsistent GraphInfo: Constant operation with id {id} is missing operations"
-                    ),
-                }
-                .into());
             }
+            refitter.refit_cuda_engine()?;
         }
-        refitter.refit_cuda_engine()?;
 
-        let exec = engine
+        let mut exec = engine
             .create_execution_context()
             .map_err(|e| crate::error::Error::GraphBuildError { source: e.into() })?;
 
-        MLGraph::new(
+        let cuda_stream = self
+            .cuda_context
+            .new_stream()
+            .map_err(|e| crate::error::Error::GraphBuildError { source: e.into() })?;
+
+        if !self.weight_input_tensors.is_empty() {
+            bind_weight_input_tensors(
+                &mut exec,
+                &graph,
+                &self.weight_input_tensors,
+                &self.tensors,
+                &cuda_stream,
+            )?;
+        }
+
+        let exclude_weight_inputs: HashSet<u32> =
+            self.weight_input_tensors.keys().copied().collect();
+        MLGraph::new_excluding_inputs(
             MLBackendGraph::TrtxEngine(TrtxGraph {
                 _engine: engine,
                 exec,
-                cuda_stream: self
-                    .cuda_context
-                    .new_stream()
-                    .map_err(|e| crate::error::Error::GraphBuildError { source: e.into() })?,
+                cuda_stream,
             }),
             &graph,
+            &exclude_weight_inputs,
         )
     }
 }
@@ -485,6 +640,7 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
             tensors,
             caching_enabled: self.options.engine_caching,
             weights_as_inputs: self.options.weights_as_inputs,
+            weight_input_tensors: HashMap::new(),
         }))
     }
 
