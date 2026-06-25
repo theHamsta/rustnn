@@ -1,7 +1,6 @@
 use crate::mlcontext;
 
 pub mod caching;
-
 #[cfg(all(target_os = "macos", feature = "coreml-runtime"))]
 pub mod coreml;
 
@@ -97,7 +96,10 @@ pub mod trtx {
     pub(crate) use crate::backends::DisabledContext as TrtxContext;
 
     impl TrtxContext {
-        pub(crate) fn new(_cuda_device_idx: u32) -> crate::error::Result<Self> {
+        pub(crate) fn new(
+            _cuda_device_idx: u32,
+            _options: &crate::mlcontext::TrtxOptions,
+        ) -> crate::error::Result<Self> {
             panic!("Tried to create disabled Trtx backend");
         }
     }

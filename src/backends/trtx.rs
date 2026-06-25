@@ -30,6 +30,7 @@ use crate::error::Error;
 use crate::error::GraphBuilderError;
 use crate::graph::WeightsContext;
 use crate::mlcontext::MLTensor;
+use crate::mlcontext::TrtxOptions;
 use crate::mlcontext::{ListDevices, MLOperand};
 use crate::mlcontext::{MLBackendBuilder, MLGraph};
 use crate::mlcontext::{MLBackendContext, MLBackendGraph};
@@ -177,6 +178,7 @@ pub(crate) struct TrtxContext<'context> {
     runtime: Arc<Mutex<trtx::Runtime<'context>>>,
     config: Arc<Mutex<trtx::BuilderConfig<'context>>>, // needs to be destroyed before builder
     builder: Arc<Mutex<trtx::Builder<'context>>>,
+    options: TrtxOptions,
 }
 
 impl std::fmt::Debug for TrtxContext<'_> {
@@ -195,7 +197,7 @@ static LOGGER: std::sync::LazyLock<trtx::Logger> =
     std::sync::LazyLock::new(|| trtx::Logger::log_crate().unwrap());
 
 impl<'context> TrtxContext<'context> {
-    pub(crate) fn new(cuda_device_idx: u32) -> TrtxResult<Self> {
+    pub(crate) fn new(cuda_device_idx: u32, options: &TrtxOptions) -> TrtxResult<Self> {
         // this retains the primary context
         let cuda_ctx = CudaContext::new(cuda_device_idx as usize)?;
         let mut builder = trtx::Builder::new(&LOGGER)?;
@@ -214,6 +216,7 @@ impl<'context> TrtxContext<'context> {
             runtime,
             builder: Arc::new(builder.into()),
             config,
+            options: options.clone(),
         })
     }
 }
@@ -228,6 +231,7 @@ pub(crate) struct TrtxBuilder<'builder> {
     operands: HashMap<String, MLOperand>,
     tensors: Arc<RwLock<Vec<TrtxTensor>>>,
     caching_enabled: bool,
+    weights_as_inputs: bool,
 }
 
 impl std::fmt::Debug for TrtxBuilder<'_> {
@@ -479,11 +483,8 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
             cuda_context: Arc::clone(&self.cuda_ctx),
             operands: HashMap::new(),
             tensors,
-            // disabled for now, since feature experimental.
-            // can be enabled with more test coverage, but will remain a double-sided sword
-            // e.g. if you change trtx converter, changes might not be visible, since cache skips conversion
-            // maybe the build hash of certain trtx related files could be included in hash
-            caching_enabled: false,
+            caching_enabled: self.options.engine_caching,
+            weights_as_inputs: self.options.weights_as_inputs,
         }))
     }
 

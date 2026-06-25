@@ -353,6 +353,33 @@ pub enum MLPowerPreference {
     LowPower,
 }
 
+/// Options that steer backend or RustNN internals, experiments
+/// Could be replaced later by a proper API for RustNN options, internals and for backends
+#[derive(PartialEq, Eq, Clone, Debug, Default)]
+pub struct RustNNOptions {
+    pub trtx: TrtxOptions,
+}
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub struct TrtxOptions {
+    pub engine_caching: bool,
+    pub weights_as_inputs: bool,
+}
+
+#[expect(clippy::derivable_impls)]
+impl Default for TrtxOptions {
+    fn default() -> Self {
+        Self {
+            // disabled for now, since feature experimental.
+            // can be enabled with more test coverage, but will remain a double-sided sword
+            // e.g. if you change trtx converter, changes might not be visible, since cache skips conversion
+            // maybe the build hash of certain trtx related files could be included in hash
+            engine_caching: false,
+            // potential way to save VRAM, would also require weight transforms
+            weights_as_inputs: false,
+        }
+    }
+}
+
 /// https://www.w3.org/TR/webnn/#dictdef-mlcontextoptions
 /// https://www.w3.org/TR/webnn/#api-ml
 ///
@@ -367,6 +394,7 @@ pub struct MLContextOptions {
     // - device_type (CPU, NPU, GPU) like pywebnn
     pub(crate) device_hint: Option<BackendDevice>,
     pub(crate) backend_hint: Option<Backend>,
+    pub(crate) rustnn_options: RustNNOptions,
 }
 
 impl MLContextOptions {
@@ -376,6 +404,7 @@ impl MLContextOptions {
             accelerated,
             device_hint: None,
             backend_hint: None,
+            rustnn_options: Default::default(),
         }
     }
 
@@ -402,6 +431,11 @@ impl MLContextOptions {
 
     pub fn with_rustnn_device_hint(mut self, device: BackendDevice) -> Self {
         self.device_hint = Some(device);
+        self
+    }
+
+    pub fn with_rustnn_options(mut self, options: RustNNOptions) -> Self {
+        self.rustnn_options = options;
         self
     }
 }
@@ -517,6 +551,7 @@ impl MLTensorDescriptor {
 pub struct MLContext<'context> {
     pub(crate) backend: Box<dyn MLBackendContext<'context> + 'context>,
     pub(crate) device: BackendDevice,
+    pub(crate) rustnn_options: RustNNOptions,
 }
 
 impl<'context> MLContext<'context> {
@@ -530,7 +565,7 @@ impl<'context> MLContext<'context> {
                 Box::new(OrtContext::new_from_ep_idx(ep_device_idx)?)
             }
             crate::backend_selection::BackendDevice::Trtx { cuda_device_idx } => Box::new(
-                TrtxContext::new(cuda_device_idx)
+                TrtxContext::new(cuda_device_idx, &options.rustnn_options.trtx)
                     .map_err(|e| Error::ContextCreationError { source: e.into() })?,
             ),
             crate::backend_selection::BackendDevice::Coreml { device_type } => {
@@ -540,7 +575,11 @@ impl<'context> MLContext<'context> {
                 Box::new(LiteRtContext::new_from_device_type(device_type)?)
             }
         };
-        Ok(Self { backend, device })
+        Ok(Self {
+            backend,
+            device,
+            rustnn_options: options.rustnn_options.clone(),
+        })
     }
 
     #[expect(unreachable_code)]
@@ -552,7 +591,11 @@ impl<'context> MLContext<'context> {
             crate::backend_selection::BackendDevice::Coreml { device_type } => todo!(),
             crate::backend_selection::BackendDevice::LiteRt { .. } => todo!(),
         };
-        Ok(Self { backend, device })
+        Ok(Self {
+            backend,
+            device,
+            rustnn_options: Default::default(),
+        })
     }
     pub fn accelerated(&self) -> bool {
         self.backend.accelerated()
@@ -678,6 +721,14 @@ impl<'context> MLContext<'context> {
         max_shape: &[u64],
     ) -> Result<()> {
         self.backend.rustnn_set_tensor_capacity(tensor, max_shape)
+    }
+
+    pub fn set_rustnn_options(&mut self, optons: RustNNOptions) {
+        self.rustnn_options = optons;
+    }
+
+    pub fn rustnn_options(&self) -> &RustNNOptions {
+        &self.rustnn_options
     }
 }
 
