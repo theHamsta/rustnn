@@ -2438,6 +2438,7 @@ impl CoremlMlProgramConverter {
             let constant = graph
                 .constant_operand_ids_to_handles
                 .get(&operand_id)
+                .and_then(|c| c.as_owned_data())
                 .ok_or_else(|| GraphError::ConversionFailed {
                     format: "coreml_mlprogram".to_string(),
                     reason: format!("constexpr operand {} has no constant data", operand_id),
@@ -5563,6 +5564,7 @@ impl super::GraphConverter for CoremlMlProgramConverter {
             graph_info
                 .constant_operand_ids_to_handles
                 .values()
+                .filter_map(|c| c.as_owned_data())
                 .map(|c| c.data.len() + 128)
                 .sum(),
         );
@@ -5782,7 +5784,14 @@ impl super::GraphConverter for CoremlMlProgramConverter {
         }
 
         // Add constant operands as const operations
-        for (operand_id, constant_data) in &graph_info.constant_operand_ids_to_handles {
+        for (operand_id, constant_ref) in &graph_info.constant_operand_ids_to_handles {
+            let constant_data =
+                constant_ref
+                    .as_owned_data()
+                    .ok_or_else(|| GraphError::ConversionFailed {
+                        format: "coreml_mlprogram".into(),
+                        reason: format!("Constant operand {operand_id} has no inline data"),
+                    })?;
             let operand =
                 graph_info
                     .operand(*operand_id)
@@ -11223,9 +11232,10 @@ mod tests {
         });
 
         // Add constant data
-        graph
-            .constant_operand_ids_to_handles
-            .insert(0, ConstantData { data, label: None });
+        graph.constant_operand_ids_to_handles.insert(
+            0,
+            crate::graph::ConstantReference::OwnedData(ConstantData { data, label: None }),
+        );
 
         // Add a simple relu operation
         graph.operations.push(op_from_operator_options(
@@ -11397,10 +11407,10 @@ mod tests {
         });
         graph.constant_operand_ids_to_handles.insert(
             0,
-            ConstantData {
+            crate::graph::ConstantReference::OwnedData(ConstantData {
                 data: data1,
                 label: None,
-            },
+            }),
         );
 
         // Operand 1: Second Float16 constant [2]
@@ -11419,7 +11429,8 @@ mod tests {
             ConstantData {
                 data: data2,
                 label: None,
-            },
+            }
+            .into(),
         );
 
         // Operand 2: Output
@@ -11510,7 +11521,7 @@ mod tests {
         });
         graph
             .constant_operand_ids_to_handles
-            .insert(0, ConstantData { data, label: None });
+            .insert(0, ConstantData { data, label: None }.into());
 
         // Output
         graph.operands.push(Operand {
@@ -11623,7 +11634,7 @@ mod tests {
         });
         graph
             .constant_operand_ids_to_handles
-            .insert(0, ConstantData { data, label: None });
+            .insert(0, ConstantData { data, label: None }.into());
 
         // Output
         graph.operands.push(Operand {
@@ -11891,7 +11902,8 @@ mod tests {
                         .flat_map(i64::to_le_bytes)
                         .collect(),
                     label: None,
-                },
+                }
+                .into(),
             )]),
             id_to_constant_tensor_operand_map: HashMap::new(),
             quantized: false,
@@ -12201,7 +12213,8 @@ mod tests {
                     ConstantData {
                         data: (-1i32).to_le_bytes().to_vec(),
                         label: None,
-                    },
+                    }
+                    .into(),
                 );
             }
             let converted = CoremlMlProgramConverter.convert(&graph).unwrap();
@@ -12407,7 +12420,8 @@ mod tests {
             ConstantData {
                 data: vec![1u8; input_len],
                 label: None,
-            },
+            }
+            .into(),
         );
         graph.operands.push(Operand {
             name: Some("scale".to_string()),
@@ -12424,7 +12438,8 @@ mod tests {
             ConstantData {
                 data: 0.5f32.to_le_bytes().repeat(scale_len),
                 label: None,
-            },
+            }
+            .into(),
         );
         graph.operands.push(Operand {
             name: Some("output".to_string()),
