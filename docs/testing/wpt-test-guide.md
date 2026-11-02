@@ -110,6 +110,29 @@ WPT_BACKEND=trtx cargo test --test run_wpt_conformance \
 cargo test --test run_wpt_conformance --features onnx-runtime -- relu --test-threads 1
 ```
 
+To investigate TensorRT constant refitting across data types, configure the SDK library paths
+as described in the [TensorRT guide](https://rustnn.github.io/rustnn/integration/tensorrt/), then run:
+
+```bash
+cargo test --test test_trtx_constant_refit --features trtx-runtime -- \
+  --ignored --nocapture --test-threads=1
+```
+
+These manual Rust tests reproduce the constant-only `min`, `max`, and `div` graphs from
+`int32-full-range.https.any.js` with different data types, and substitute `add`, `sub`, `mul`,
+and `pow` to investigate other binary arithmetic. The diagnostic explicitly marks
+both constants refittable, bypassing rustnn's baked-constant exclusions, and prints whether
+TensorRT retains their refit prototypes with and without weight stripping. Missing prototypes
+are recorded as diagnostic results; floating-point cases must refit successfully. A separate
+execution test checks float32, float16, int32, uint32, int64, and uint64 for all seven
+operations through the normal backend. It keeps engine caching enabled and rebuilds integer
+arithmetic graphs with different bounded constants to detect stale folded results. Float16
+also uses finite inputs because literal
+conversion of the original large integers yields infinities. The additional arithmetic
+operations also use bounded positive inputs across all types to separate refit failures from
+overflow and invalid powers. Narrow and unsigned diagnostic inputs use Rust integer casts
+of the original values.
+
 ## Backend selection
 
 Set `WPT_BACKEND` to limit which backends register trials:
