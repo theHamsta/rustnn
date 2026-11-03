@@ -631,6 +631,9 @@ pub enum GraphError {
     /// Device tensor is not writable.
     #[error("device tensor is not writable")]
     DeviceTensorNotWritable,
+    /// Device tensor is not writable.
+    #[error("Dynamic constants are not allowed: operand_id {operand_id}, {operand:?}")]
+    DynamicConstant { operand_id: u32, operand: Operand },
     /// Missing runtime `kind` tensor ``name``.
     #[error("missing runtime {kind} tensor `{name}`")]
     RuntimeTensorMissing { kind: String, name: String },
