@@ -1,4 +1,6 @@
 //! Reproduce the int32-full-range WPT graphs with other constant data types.
+//! The length matrix repeats the same values around 64 elements and at larger sizes
+//! to distinguish size-dependent refit behavior from dtype and value effects.
 //! Run explicitly with the TensorRT library paths set by the Makefile.
 #![cfg(feature = "trtx-runtime")]
 
@@ -59,7 +61,7 @@ fn encode(dtype: DataType, values: &[i32]) -> Vec<u8> {
         .collect()
 }
 
-fn graph(dtype: DataType, op: &str, finite: bool) -> GraphInfo {
+fn graph(dtype: DataType, op: &str, finite: bool, length: Option<usize>) -> GraphInfo {
     let (mut a, mut b) = if op == "div" {
         (DIV_A.to_vec(), DIV_B.to_vec())
     } else {
@@ -79,6 +81,11 @@ fn graph(dtype: DataType, op: &str, finite: bool) -> GraphInfo {
         if op != "div" {
             b = vec![17, 16, -17, -16, -63, -64, 62, 63];
         }
+    }
+    if let Some(length) = length {
+        // Repeat the same values so only tensor length changes in the size sweep.
+        a = a.into_iter().cycle().take(length).collect();
+        b = b.into_iter().cycle().take(length).collect();
     }
     let descriptor = OperandDescriptor {
         data_type: dtype,
@@ -201,6 +208,10 @@ fn force_refit(graph: &GraphInfo, strip: bool) -> Result<(), String> {
 #[test]
 #[ignore = "manual TensorRT SDK diagnostic; explicitly forces refit of baked constants"]
 fn constant_refit_dtype_matrix() {
+    check_constant_refit_dtype_matrix(None);
+}
+
+fn check_constant_refit_dtype_matrix(length: Option<usize>) {
     let mut options = RustNNOptions::default();
     options.trtx.engine_caching = false;
     let mut context = MLContext::create(
@@ -230,13 +241,17 @@ fn constant_refit_dtype_matrix() {
                 }
                 let normal_build = MLGraphBuilder::new(&mut context)
                     .unwrap()
-                    .build_graph_info(graph(dtype, op, finite))
+                    .build_graph_info(graph(dtype, op, finite, length))
                     .map(|_| ());
                 println!("BACKEND {dtype:?} {op} finite={finite}: {normal_build:?}");
                 for strip in [false, true] {
-                    let result = force_refit(&graph(dtype, op, finite), strip);
+                    let result = force_refit(&graph(dtype, op, finite, length), strip);
                     println!("REFIT {dtype:?} {op} finite={finite} strip={strip}: {result:?}");
-                    if matches!(dtype, DataType::Float32 | DataType::Float16) {
+                    // TensorRT-RTX 1.7 retains INT32 refit prototypes above 64 elements.
+                    if matches!(dtype, DataType::Float32 | DataType::Float16)
+                        || (matches!(dtype, DataType::Int32 | DataType::Uint32)
+                            && length.is_some_and(|length| length > 64))
+                    {
                         result.unwrap();
                     } else if let Err(error) = result {
                         assert!(
@@ -274,6 +289,10 @@ fn decode(dtype: DataType, bytes: &[u8]) -> Vec<f64> {
 #[test]
 #[ignore = "requires a TensorRT-RTX GPU and SDK library paths"]
 fn dtype_substitutions_execute_correctly() {
+    check_dtype_substitutions_execute_correctly(None);
+}
+
+fn check_dtype_substitutions_execute_correctly(length: Option<usize>) {
     // Leave engine caching enabled. Rebuild identical topologies with different
     // bounded constants below to catch reuse of a stale constant-folded result.
     let options = RustNNOptions::default();
@@ -300,7 +319,7 @@ fn dtype_substitutions_execute_correctly() {
                 {
                     continue;
                 }
-                let mut info = graph(dtype, op, finite);
+                let mut info = graph(dtype, op, finite, length);
                 let bounded = matches!(dtype, DataType::Uint32 | DataType::Uint64)
                     || (additional_arithmetic(op)
                         && matches!(dtype, DataType::Int32 | DataType::Int64));
@@ -309,7 +328,7 @@ fn dtype_substitutions_execute_correctly() {
                     // weights differ, so a topology-only cache must be bypassed.
                     let count = info.operands[0].descriptor.element_count().unwrap();
                     let revision = i32::from(finite) * 10;
-                    let a: Vec<i32> = (0..count).map(|i| i as i32 + 2 + revision).collect();
+                    let a: Vec<i32> = (0..count).map(|i| (i % 8) as i32 + 2 + revision).collect();
                     let b: Vec<i32> = (0..count).map(|i| i as i32 % 2 + 1).collect();
                     info.constant_operand_ids_to_handles
                         .get_mut(&0)
@@ -370,5 +389,16 @@ fn dtype_substitutions_execute_correctly() {
                 println!("EXECUTE {dtype:?} {op} finite={finite}: correct");
             }
         }
+    }
+}
+
+#[test]
+#[ignore = "manual TensorRT SDK diagnostic; sweeps constant lengths around 64 elements"]
+fn constant_refit_length_matrix() {
+    for length in [63, 64, 65, 128, 1024] {
+        println!("LENGTH {length}: forced refit");
+        check_constant_refit_dtype_matrix(Some(length));
+        println!("LENGTH {length}: execution");
+        check_dtype_substitutions_execute_correctly(Some(length));
     }
 }
