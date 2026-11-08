@@ -303,15 +303,16 @@ pub enum GpuBuffer {
 pub struct ExportedGpuBuffer {
     pub(crate) gpu_buffer: GpuBuffer,
     pub(crate) tensor_id: usize,
+    // could use a drop bomb (https://docs.rs/drop_bomb/latest/drop_bomb/) to force users to destroy this with the MLContext
 }
 
-impl<'mlcontext> std::ops::DerefMut for ExportedGpuBuffer {
+impl std::ops::DerefMut for ExportedGpuBuffer {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.gpu_buffer
     }
 }
 
-impl<'mlcontext> std::ops::Deref for ExportedGpuBuffer {
+impl std::ops::Deref for ExportedGpuBuffer {
     type Target = GpuBuffer;
 
     fn deref(&self) -> &Self::Target {
