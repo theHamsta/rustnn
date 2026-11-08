@@ -190,8 +190,44 @@ impl<'context> MLBackendGraph<'context> {
 
 /// Placeholder for the WebGPU device of `ML.createContext(GPUDevice)`; not implemented yet.
 // aka WebGpuDevice
-#[derive(Debug)]
-pub struct GpuDevice {}
+#[derive(Debug, Clone)]
+pub enum GpuDevice {
+    // could also make "cuda" a dedicated feature later to allow to interact with ORT/LiteRT
+    #[cfg(feature = "trtx-runtime")]
+    /// from CUDA context
+    CudaDevice(std::sync::Arc<cudarc::driver::CudaContext>),
+    #[cfg(feature = "wgpu-native")]
+    /// from wgpu device
+    WgpuDevice(wgpu::Device),
+    /// from a Windows adapter (e.g. cross process)
+    WindowsAdapter {
+        luid_high: u32,
+        luid_low: u32,
+    },
+    /// from a Linux GPU (e.g. cross process)
+    LinuxDmaAdapter {
+        pci_domain: u32,
+        pci_bus: u32,
+        pci_device: u32,
+        pci_function: u32,
+    },
+    /// from a Linux GPU using opaque file descriptors
+    LinuxOpaqueFdAdapter {
+        pci_domain: u32,
+        pci_bus: u32,
+        pci_device: u32,
+        pci_function: u32,
+    },
+    /// from a MacOS GPU using whatever sorcery is required on MacOS (also file descriptors?)
+    MetalAdapter {/*...*/},
+
+    // Metal device, same context for ML and GPU
+    MetalDevice {/*...*/},
+    // Vulkan device, same context for ML and GPU
+    VulkanDevice {/*...*/},
+    // D3D12 device, same context for ML and GPU
+    D3D12Device {/*...*/},
+}
 
 /// Reason a context was lost. <https://www.w3.org/TR/webnn/#api-mlcontext>
 #[derive(Debug)]
@@ -601,6 +637,7 @@ pub struct MLContext<'context> {
     pub(crate) device: BackendDevice,
     pub(crate) bypass_allowed_data_types_checks: bool,
     pub(crate) allow_int4_uint4: bool,
+    pub(crate) gpu_device: Option<GpuDevice>,
 }
 
 impl<'context> MLContext<'context> {
@@ -662,13 +699,14 @@ impl<'context> MLContext<'context> {
             device,
             bypass_allowed_data_types_checks: options.bypass_allowed_data_types_checks,
             allow_int4_uint4: options.allow_int4_uint4,
+            gpu_device: None,
         })
     }
 
     /// Not implemented: `ML.createContext(GPUDevice)`.
     #[expect(unreachable_code)]
-    pub async fn create_from_gpu_device(gpu_device: &GpuDevice) -> Result<Self> {
-        let device = select_backend_by_gpu(gpu_device)?;
+    pub async fn create_from_gpu_device(gpu_device: GpuDevice) -> Result<Self> {
+        let device = select_backend_by_gpu(&gpu_device)?;
         let backend = match device {
             crate::backend_selection::BackendDevice::Onnx { .. } => todo!(),
             crate::backend_selection::BackendDevice::Trtx { cuda_device_idx } => todo!(),
@@ -682,6 +720,7 @@ impl<'context> MLContext<'context> {
             device,
             bypass_allowed_data_types_checks: false,
             allow_int4_uint4: false,
+            gpu_device: Some(gpu_device),
         })
     }
     /// Whether the selected device is a GPU or NPU rather than a CPU.

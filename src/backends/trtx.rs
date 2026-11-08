@@ -311,7 +311,10 @@ impl std::fmt::Debug for TrtxContext<'_> {
 impl<'context> TrtxContext<'context> {
     pub(crate) fn new(cuda_device_idx: u32, options: Option<&RustNNOptions>) -> TrtxResult<Self> {
         // this retains the primary context
-        let cuda_ctx = CudaContext::new(cuda_device_idx as usize)?;
+        Self::new_from_context(CudaContext::new(cuda_device_idx as usize)?, options)
+    }
+
+    pub(crate) fn new_from_context(cuda_ctx: Arc<CudaContext>, options: Option<&RustNNOptions>) -> TrtxResult<Self> {
         let device_cache_id = cuda_device_cache_id(&cuda_ctx)?;
         let mut builder = trtx::Builder::new(&LOGGER)?;
         let mut config = builder.create_config()?;

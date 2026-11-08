@@ -439,6 +439,10 @@ pub enum Error {
         #[from]
         source: DriverError,
     },
+
+    /// No ML device for requested GPU
+    #[error("No ML device for requested GPU")]
+    NoMlDeviceForRequestedGpu,
 }
 
 /// Error for failed validation on a `quantizeLinear`/`dequantizeLinear` operation
