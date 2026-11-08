@@ -442,7 +442,31 @@ pub enum Error {
 
     /// No ML device for requested GPU
     #[error("No ML device for requested GPU ({gpu:?})")]
-    NoMlDeviceForRequestedGpu{gpu: String},
+    NoMlDeviceForRequestedGpu { gpu: String },
+
+    /// A MLContext that wasn't created from a [MLContext::create_from_gpu_device] can't export tensors
+    #[error(
+        "Attempted to create an exportable tensor with MLContext that wasn't created with MLContext::create_from_gpu_device"
+    )]
+    MLContextWithoutGpu,
+
+    /// Attempted to export a tensor that is not exportable
+    #[error("Attempted to export a tensor that is not exportable: {tensor:?}")]
+    TensorNotExportable { tensor: Box<MLTensor> },
+
+    /// Attempted to create export an already exported tensor
+    #[error("Attempted to export an already exported tensor: {tensor:?}")]
+    ExportableTensorAlreadyExported { tensor: Box<MLTensor> },
+
+    /// Attempted to use an exported tensor
+    #[error(
+        "Attempted to use an exported: {tensor:?}. The tensor must be destroyed by MLContext::destroy_gpu_buffer before being available again for the MLContext"
+    )]
+    ExportedTensorCannotBeUsedForML { tensor: Box<MLTensor> },
+
+    /// Attempted to use an already destroyed tensor
+    #[error("Attempted to use an already destroyed tensor: {tensor:?}")]
+    TensorDestroyed { tensor: Box<MLTensor> },
 }
 
 /// Error for failed validation on a `quantizeLinear`/`dequantizeLinear` operation

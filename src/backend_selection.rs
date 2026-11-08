@@ -363,19 +363,15 @@ pub(crate) fn select_backend(options: &MLContextOptions) -> Result<BackendDevice
     })
 }
 
-pub(crate) fn select_backend_by_gpu(gpu_device: &GpuDevice) -> Result<BackendDevice> {
-    match gpu_device {
-        #[cfg(feature = "trtx-runtime")]
-        GpuDevice::CudaDevice(cuda_context) => Ok(BackendDevice::Trtx {
-            cuda_device_idx: cuda_context.cu_device().try_into().map_err(|_| {
-                crate::error::Error::NoMlDeviceForRequestedGpu {
-                    gpu: format!("{gpu_device:?}"),
-                }
-            })?,
-        }),
-        GpuDevice::WgpuDevice(_device) => todo!(),
-        _ => Err(crate::error::Error::NoMlDeviceForRequestedGpu {
-            gpu: format!("{gpu_device:?}"),
-        }),
+pub(crate) fn select_backend_device_by_gpu(gpu_device: &GpuDevice) -> Result<BackendDevice> {
+    #[cfg(feature = "trtx-runtime")]
+    if let Some(device) = crate::backends::trtx::select_backend_device_by_gpu(gpu_device) {
+        return Ok(device);
     }
+    // TODO: try other backends, e.g. ORT, LiteRT, CoreML
+    // ...
+
+    Err(crate::error::Error::NoMlDeviceForRequestedGpu {
+        gpu: format!("{gpu_device:?}"),
+    })
 }

@@ -44,6 +44,10 @@ use crate::error::Error;
 
 use crate::error::GraphBuilderError;
 use crate::graph::WeightsToHash;
+use crate::mlcontext::BackendDevice;
+use crate::mlcontext::CudaBuffer;
+use crate::mlcontext::ExportedGpuBuffer;
+use crate::mlcontext::GpuDevice;
 use crate::mlcontext::MLTensor;
 use crate::mlcontext::RustNNOptions;
 use crate::mlcontext::{ListDevices, MLOperand};
@@ -314,7 +318,10 @@ impl<'context> TrtxContext<'context> {
         Self::new_from_context(CudaContext::new(cuda_device_idx as usize)?, options)
     }
 
-    pub(crate) fn new_from_context(cuda_ctx: Arc<CudaContext>, options: Option<&RustNNOptions>) -> TrtxResult<Self> {
+    pub(crate) fn new_from_context(
+        cuda_ctx: Arc<CudaContext>,
+        options: Option<&RustNNOptions>,
+    ) -> TrtxResult<Self> {
         let device_cache_id = cuda_device_cache_id(&cuda_ctx)?;
         let mut builder = trtx::Builder::new(&LOGGER)?;
         let mut config = builder.create_config()?;
@@ -978,6 +985,60 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
         cuda_tensor.memory = unsafe { cuda_tensor.stream.alloc(new_bytes)? };
         Ok(())
     }
+
+    fn create_exportable_tensor(
+        &mut self,
+        descriptor: &crate::mlcontext::MLTensorDescriptor,
+    ) -> crate::error::Result<MLTensor> {
+        self.create_tensor(descriptor)
+    }
+
+    fn create_exportable_tensor_from_graphics_import(
+        &mut self,
+        descriptor: &crate::mlcontext::MLTensorDescriptor,
+        gpu_resource_import: crate::mlcontext::GpuBufferImport,
+    ) -> crate::error::Result<MLTensor> {
+        panic!(
+            "Backends that don't implment this method should allow to be created from a GPUDevice. This method is only called when a context was created from a GPUDevice"
+        )
+    }
+
+    fn export_to_gpu(
+        &mut self,
+        tensor: &MLTensor,
+    ) -> crate::error::Result<crate::mlcontext::ExportedGpuBuffer> {
+        let backend_tensor = &mut self.tensors[tensor.id];
+        // TODO: if this was not a normal TrtxTensor, but one of a special tensor storage like in
+        // the weightless build PR, then we would export not a CUDA tensor, but the handles that
+        // they originally gave use to import the CUDA memory, together with fence counts that need
+        // to be waited for by graphics. We expect graphics to also set the fence counts they expect
+        // us to wait on when they destroy the ExportedGpuBuffer
+        let ptr = backend_tensor
+            .memory
+            .device_ptr_mut(&backend_tensor.stream)
+            .0;
+        let len = backend_tensor.memory.len();
+        Ok(ExportedGpuBuffer {
+            gpu_buffer: crate::mlcontext::GpuBuffer::CudaBuffer(CudaBuffer {
+                ptr,
+                len,
+                stream: Arc::clone(&backend_tensor.stream),
+            }),
+            tensor_id: tensor.id,
+        })
+    }
+
+    fn destroy_gpu_buffer(
+        &mut self,
+        gpu_buffer: crate::mlcontext::ExportedGpuBuffer,
+    ) -> crate::error::Result<()> {
+        // no op: this will consume the users view to use it for graphics. The frontend will mark
+        // the tensor as useable for ML operations again and we already respect the CUDA stream
+        // timeline of our tensors. We would need to do the same for other kinds of imported tensors.
+        // For ID3D12 shared fences (or vulkan timeline semaphores shared as shared fences), we
+        // would need to read the users fence count they want us to wait on for reading or writing
+        Ok(())
+    }
 }
 
 impl ListDevices for TrtxContext<'_> {
@@ -1037,10 +1098,27 @@ impl ListDevices for TrtxContext<'_> {
     }
 }
 
+pub(crate) fn select_backend_device_by_gpu(gpu_device: &GpuDevice) -> Option<BackendDevice> {
+    match gpu_device {
+        #[cfg(feature = "trtx-runtime")]
+        GpuDevice::CudaDevice(cuda_context) => Some(BackendDevice::Trtx {
+            cuda_device_idx: cuda_context.cu_device().try_into().ok()?,
+        }),
+        GpuDevice::WgpuDevice(_device) => todo!(),
+        _ => None, // TODO
+    }
+}
+
 #[cfg(test)]
 #[cfg(feature = "trtx-runtime")]
 mod tests {
-    use crate::mlcontext::{MLBackendContext, MLTensorDescriptor};
+    use std::sync::Arc;
+
+    use log::warn;
+
+    use crate::mlcontext::{
+        GpuDevice, MLBackendContext, MLContext, MLTensorDescriptor, RustNNOptions,
+    };
     use crate::{backends::trtx::TrtxContext, mlcontext::ListDevices};
 
     #[test]
@@ -1097,6 +1175,65 @@ mod tests {
             .read_tensor(&tensor, bytemuck::cast_slice_mut(&mut download))
             .unwrap();
         assert_eq!(&upload, &download);
+    }
+
+    #[test]
+    fn test_cuda_interop() {
+        let _ = pretty_env_logger::try_init();
+        let Ok(cuda_ctx) = cudarc::driver::CudaContext::new(0) else {
+            warn!("Failed to create CUDA context");
+            return;
+        };
+        let Ok(mut ml_context) = MLContext::create_from_gpu_device(
+            GpuDevice::CudaDevice(Arc::clone(&cuda_ctx)),
+            RustNNOptions::default(),
+        ) else {
+            warn!("Failed to create Trtx context");
+            return;
+        };
+
+        let mut desc = MLTensorDescriptor::new(
+            crate::operator_enums::MLOperandDataType::Float32,
+            [2, 2].to_vec(),
+        );
+        desc.set_readable(true);
+        desc.set_writable(true);
+        let exportable = ml_context.create_exportable_tensor(&desc).unwrap();
+        let upload = vec![1.0f32, 2., 3., 4.];
+        let mut download = vec![0.0f32; 4];
+        // write to tensor via MLContext
+        ml_context.write_tensor(&exportable, &upload).unwrap();
+
+        // write to parts of the tensor with CUDA
+        let mut export = ml_context.export_to_gpu(&exportable).unwrap();
+        let cuda_buf = export.as_cuda_buffer_mut().unwrap();
+        unsafe {
+            cudarc::driver::result::memset_d8_async(
+                cuda_buf.ptr,
+                0,
+                2 * size_of::<f32>(), // 2 of 4 elements
+                cuda_buf.stream.cu_stream(),
+            )
+            .unwrap()
+        };
+
+        // using the tensor before graphics destroys them should error
+        std::assert_matches!(
+            ml_context.write_tensor(&exportable, &upload),
+            Err(crate::error::Error::ExportedTensorCannotBeUsedForML { .. })
+        );
+        std::assert_matches!(
+            ml_context.read_tensor(&exportable, &mut download),
+            Err(crate::error::Error::ExportedTensorCannotBeUsedForML { .. })
+        );
+        // handing over ownership again to mlcontext
+        ml_context.destroy_gpu_buffer(export).unwrap();
+
+        // download using mlcontext;
+        // write to tensor via MLContext
+        ml_context.read_tensor(&exportable, &mut download).unwrap();
+
+        assert_eq!(&vec![0.0f32, 0.0f32, 3., 4.], &download);
     }
 
     #[test]

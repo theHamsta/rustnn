@@ -31,6 +31,8 @@ use crate::backends::litert::LiteRtContext;
 use crate::backends::ort::OrtContext;
 use crate::backends::trtx::TrtxContext;
 use std::collections::BTreeMap;
+#[cfg(feature = "trtx-runtime")]
+use std::sync::Arc;
 use std::{collections::HashMap, fmt::Display, marker::PhantomData};
 
 pub use crate::mlcontextoptions::{
@@ -76,7 +78,7 @@ fn validate_unique_tensor_bindings(
 
 pub use crate::mlgraphbuilder::MLGraphBuilder;
 use crate::{
-    backend_selection::{select_backend, select_backend_by_gpu},
+    backend_selection::{select_backend, select_backend_device_by_gpu},
     operator_enums::MLOperandDataType,
 };
 
@@ -120,6 +122,33 @@ pub(crate) trait MLBackendContext<'context>: std::fmt::Debug + Send + Sync {
         inputs: &MLNamedTensors,
         outputs: &MLNamedTensors,
     ) -> Result<()>;
+
+    // GPU interop
+
+    fn create_exportable_tensor(&mut self, descriptor: &MLTensorDescriptor) -> Result<MLTensor> {
+        panic!(
+            "Backends that don't implment this method should allow to be created from a GPUDevice. This method is only called when a context was created from a GPUDevice"
+        )
+    }
+    fn create_exportable_tensor_from_graphics_import(
+        &mut self,
+        descriptor: &MLTensorDescriptor,
+        gpu_resource_import: GpuBufferImport,
+    ) -> Result<MLTensor> {
+        panic!(
+            "Backends that don't implment this method should allow to be created from a GPUDevice. This method is only called when a context was created from a GPUDevice"
+        )
+    }
+    fn export_to_gpu(&mut self, tensor: &MLTensor) -> Result<ExportedGpuBuffer> {
+        panic!(
+            "Backends that don't implment this method should allow to be created from a GPUDevice. This method is only called when a context was created from a GPUDevice"
+        )
+    }
+    fn destroy_gpu_buffer(&mut self, gpu_buffer: ExportedGpuBuffer) -> Result<()> {
+        panic!(
+            "Backends that don't implment this method should allow to be created from a GPUDevice. This method is only called when a context was created from a GPUDevice"
+        )
+    }
 }
 
 pub(crate) trait MLBackendBuilder<'context, 'builder>: std::fmt::Debug + Send {
@@ -191,6 +220,7 @@ impl<'context> MLBackendGraph<'context> {
 /// Placeholder for the WebGPU device of `ML.createContext(GPUDevice)`; not implemented yet.
 // aka WebGpuDevice
 #[derive(Debug, Clone)]
+#[allow(missing_docs)]
 pub enum GpuDevice {
     // could also make "cuda" a dedicated feature later to allow to interact with ORT/LiteRT
     #[cfg(feature = "trtx-runtime")]
@@ -199,20 +229,22 @@ pub enum GpuDevice {
     #[cfg(feature = "wgpu-native")]
     /// from wgpu device
     WgpuDevice(wgpu::Device),
-    /// from a Windows adapter (e.g. cross process)
+    /// from WebGPU device when running in a browser context
+    WebGPUDevice {/*...*/},
+    /// from a Windows adapter (create new GPU context with the intention to import shareable resources e.g. cross process)
     WindowsAdapter {
         luid_high: u32,
         luid_low: u32,
     },
-    /// from a Linux GPU (e.g. cross process)
+    /// from a Linux GPU (create new GPU context with the intention to import DMA bufs e.g. cross process)
     LinuxDmaAdapter {
         pci_domain: u32,
         pci_bus: u32,
         pci_device: u32,
         pci_function: u32,
     },
-    /// from a Linux GPU using opaque file descriptors
-    LinuxOpaqueFdAdapter {
+    /// from a Linux GPU using opaque file descriptors (create new GPU context with the intention to import opaque file descriptors e.g. cross process)
+    OpaqueFdAdapter {
         pci_domain: u32,
         pci_bus: u32,
         pci_device: u32,
@@ -227,6 +259,114 @@ pub enum GpuDevice {
     VulkanDevice {/*...*/},
     // D3D12 device, same context for ML and GPU
     D3D12Device {/*...*/},
+}
+
+/// Importable graphics resource and importable sync primitive intended to be used to record shared
+/// timeline of this buffer between ML operations and graphics operations
+#[derive(Debug, Clone)]
+#[allow(missing_docs)]
+pub enum GpuBufferImport {
+    WindowsShareableHandles {
+        handle_buffer: u64, // HANDLE when adding windows crate
+        handle_fence: u64,  // HANDLE when adding windows crate
+    },
+    LinuxDmaBufs {
+        dma_buf_fd: u64,
+        dma_fence_fd: u64,
+    },
+    OpaqueFds {
+        buffer_fd: u64,
+        timeline_semaphore_fd: u64,
+    },
+}
+
+#[cfg(feature = "trtx-runtime")]
+#[derive(Debug)]
+#[allow(missing_docs)] // TODO
+pub struct CudaBuffer {
+    pub ptr: cudarc::driver::sys::CUdeviceptr,
+    pub len: usize,
+    pub stream: Arc<cudarc::driver::CudaStream>,
+}
+
+#[derive(Debug)]
+#[allow(missing_docs)]
+pub enum GpuBuffer {
+    #[cfg(feature = "trtx-runtime")]
+    CudaBuffer(CudaBuffer),
+    #[cfg(feature = "wgpu-native")]
+    WgpuBuffer { buffer: wgpu::Buffer },
+}
+
+#[derive(Debug)]
+#[allow(missing_docs)]
+pub struct ExportedGpuBuffer {
+    pub(crate) gpu_buffer: GpuBuffer,
+    pub(crate) tensor_id: usize,
+}
+
+impl<'mlcontext> std::ops::DerefMut for ExportedGpuBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.gpu_buffer
+    }
+}
+
+impl<'mlcontext> std::ops::Deref for ExportedGpuBuffer {
+    type Target = GpuBuffer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.gpu_buffer
+    }
+}
+
+impl GpuBuffer {
+    #[cfg(feature = "trtx-runtime")]
+    /// Returns `true` if the exported gpu buffer is [`CudaBuffer`].
+    ///
+    /// [`CudaBuffer`]: ExportedGpuBuffer::CudaBuffer
+    #[must_use]
+    pub fn is_cuda_buffer(&self) -> bool {
+        matches!(self, Self::CudaBuffer { .. })
+    }
+
+    #[cfg(feature = "trtx-runtime")]
+    /// Returns a reference to a [CudaBuffer] if the exported buffer is of that variant
+    pub fn as_cuda_buffer(&self) -> Option<&CudaBuffer> {
+        if let Self::CudaBuffer(buffer) = self {
+            Some(buffer)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "trtx-runtime")]
+    /// Returns a reference to a [CudaBuffer] if the exported buffer is of that variant
+    pub fn as_cuda_buffer_mut(&mut self) -> Option<&mut CudaBuffer> {
+        if let Self::CudaBuffer(buffer) = self {
+            Some(buffer)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "wgpu-native")]
+    /// Returns `true` if the exported gpu buffer is [`WgpuBuffer`].
+    ///
+    /// [`WgpuBuffer`]: ExportedGpuBuffer::WgpuBuffer
+    #[must_use]
+    pub fn is_wgpu_buffer(&self) -> bool {
+        matches!(self, Self::WgpuBuffer { .. })
+    }
+
+    #[cfg(feature = "wgpu-native")]
+    /// Returns a reference to a [wgpu::Buffer] if the exported buffer is of that variant
+    pub fn as_wgpu_buffer(&self) -> Option<&wgpu::Buffer> {
+        if let Self::WgpuBuffer { buffer } = self {
+            Some(buffer)
+        } else {
+            None
+        }
+    }
 }
 
 /// Reason a context was lost. <https://www.w3.org/TR/webnn/#api-mlcontext>
@@ -255,7 +395,7 @@ pub struct MLTensor {
     pub(crate) constant: bool,
     /// internal slots as per <https://www.w3.org/TR/webnn/#api-mltensor>
     pub(crate) descriptor: MLTensorDescriptor,
-    //context: &'context MLContext, // todo, omit context?
+    //context: &'context MLContext, // todo, add context? Better: make id's globablly unique!
     //// pending promises, need to be canceled when tensor is destroyed
 }
 
@@ -283,6 +423,7 @@ impl MLTensor {
     /// Not implemented: dropping the tensor releases it. <https://www.w3.org/TR/webnn/#api-mltensor-destroy>
     // TODO: or replace by Rust's drop?
     pub fn destroy(&self) {
+        // set on MLContext self.tensor_state[tensor.id].export_state = TensorExportState::Destroyed;
         todo!() // destroying needs to cancel pending promises
     }
     /// Not implemented.
@@ -625,12 +766,26 @@ impl MLTensorDescriptor {
     }
 }
 
+#[derive(Debug, Default, Eq, PartialEq, Clone, Copy)]
+pub(crate) enum TensorExportState {
+    #[default]
+    NotExportable,
+    OwnedByMLContext,
+    ExportedToGraphics,
+    Destroyed,
+}
+
+#[derive(Debug, Eq, PartialEq, Default, Clone, Copy)]
+struct TensorState {
+    export_state: TensorExportState,
+}
+
 /// Execution context bound to one backend device. <https://www.w3.org/TR/webnn/#api-mlcontext>
 ///
 /// Create it with [`MLContext::create`], build graphs with [`MLGraphBuilder::new`], create
 /// tensors with [`MLContext::create_tensor`], and run graphs with [`MLContext::dispatch`].
 /// The context is `Send + Sync`, so it can be shared behind a `Mutex` across threads.
-// TODO: this is wrong. must be 'context and `for <'builder>` to be valid for each builder lifetime (multiple children!)
+// TODO: this is wrong. Must be 'context and `for <'builder>` to be valid for each builder lifetime (multiple children!)
 #[derive(Debug)]
 pub struct MLContext<'context> {
     pub(crate) backend: Box<dyn MLBackendContext<'context> + 'context>,
@@ -638,6 +793,7 @@ pub struct MLContext<'context> {
     pub(crate) bypass_allowed_data_types_checks: bool,
     pub(crate) allow_int4_uint4: bool,
     pub(crate) gpu_device: Option<GpuDevice>,
+    tensor_state: Vec<TensorState>,
 }
 
 impl<'context> MLContext<'context> {
@@ -700,27 +856,34 @@ impl<'context> MLContext<'context> {
             bypass_allowed_data_types_checks: options.bypass_allowed_data_types_checks,
             allow_int4_uint4: options.allow_int4_uint4,
             gpu_device: None,
+            tensor_state: vec![],
         })
     }
 
     /// Not implemented: `ML.createContext(GPUDevice)`.
-    #[expect(unreachable_code)]
-    pub async fn create_from_gpu_device(gpu_device: GpuDevice) -> Result<Self> {
-        let device = select_backend_by_gpu(&gpu_device)?;
-        let backend = match device {
-            crate::backend_selection::BackendDevice::Onnx { .. } => todo!(),
-            crate::backend_selection::BackendDevice::Trtx { cuda_device_idx } => todo!(),
-            crate::backend_selection::BackendDevice::Coreml { device_type } => todo!(),
-            crate::backend_selection::BackendDevice::LiteRt { .. } => todo!(),
-            crate::backend_selection::BackendDevice::Cann { .. } => todo!(),
-            BackendDevice::BurnCpu => todo!(),
+    ///async
+    pub fn create_from_gpu_device(gpu_device: GpuDevice, options: RustNNOptions) -> Result<Self> {
+        let backend_device = select_backend_device_by_gpu(&gpu_device)?;
+        let backend: Box<dyn MLBackendContext> = match (backend_device, &gpu_device) {
+            #[cfg(feature = "trtx-runtime")]
+            (
+                crate::backend_selection::BackendDevice::Trtx { .. },
+                GpuDevice::CudaDevice(cuda_ctx),
+            ) => Box::new(TrtxContext::new_from_context(
+                Arc::clone(cuda_ctx),
+                Some(&options),
+            )?),
+            _ => unreachable!(
+                "When a backend device is selected, the backend must also support being constructed with that GpuDevice"
+            ),
         };
         Ok(Self {
             backend,
-            device,
+            device: backend_device,
             bypass_allowed_data_types_checks: false,
             allow_int4_uint4: false,
             gpu_device: Some(gpu_device),
+            tensor_state: vec![],
         })
     }
     /// Whether the selected device is a GPU or NPU rather than a CPU.
@@ -745,7 +908,8 @@ impl<'context> MLContext<'context> {
         descriptor: &MLOperandDescriptor,
         input_data: &[u8], // with owned variant?
     ) -> MLTensor {
-        todo!()
+        todo!();
+        // self.tensor_state.push(TensorState{export_state: TensorExportState::NotExportable});
     }
 
     /// Allocate a tensor on the backend device. <https://www.w3.org/TR/webnn/#api-mlcontext-createtensor>
@@ -764,7 +928,103 @@ impl<'context> MLContext<'context> {
     pub fn create_tensor(&mut self, descriptor: &MLTensorDescriptor) -> Result<MLTensor> {
         let tensor = self.backend.create_tensor(descriptor)?;
         tracing::debug!(tensor_id = tensor.id);
+        self.tensor_state.push(TensorState {
+            export_state: TensorExportState::NotExportable,
+        });
         Ok(tensor)
+    }
+
+    /// Creates an MLTensor associated with this MLContext which may be exported to the given GPUDevice using [MLContext::export_to_gpu]
+    ///
+    /// This function only works when the MLContext can create the needed graphics resource which is
+    /// the case for CUDA, wgpu and WebGPU. For other cases use [create_exportable_tensor_from_graphics_import]
+    ///
+    /// See https://www.w3.org/TR/webnn/#dom-mlcontext-createexportabletensor
+    #[tracing::instrument(
+        skip_all,
+        err,
+        level = "debug",
+        fields(
+            data_type = ?descriptor.data_type(),
+            shape = ?descriptor.shape(),
+            readable = descriptor.readable(),
+            writable = descriptor.writable(),
+        )
+    )]
+    pub fn create_exportable_tensor(
+        &mut self,
+        descriptor: &MLTensorDescriptor,
+    ) -> Result<MLTensor> {
+        if self.gpu_device.is_none() {
+            return Err(crate::error::Error::MLContextWithoutGpu);
+        }
+        let tensor = self.backend.create_exportable_tensor(descriptor)?;
+        tracing::debug!(tensor_id = tensor.id);
+        self.tensor_state.push(TensorState {
+            export_state: TensorExportState::OwnedByMLContext,
+        });
+        Ok(tensor)
+    }
+
+    /// Like [create_exportable_tensor] but for situations where the MLContext can't create the
+    /// graphics resource itself. This is for instance the case if the graphics context is running
+    /// in a different context.
+    ///
+    /// In a addition to a [MLTensorDescriptor] for the tensor to be created provide a GPUDevice
+    ///
+    /// The buffer described by the GPU must be kept alive for the lifetime of the MLContext.
+    #[tracing::instrument(
+        skip_all,
+        err,
+        level = "debug",
+        fields(
+            data_type = ?descriptor.data_type(),
+            shape = ?descriptor.shape(),
+            readable = descriptor.readable(),
+            writable = descriptor.writable(),
+        )
+    )]
+    pub fn create_exportable_tensor_from_graphics_import(
+        &mut self,
+        descriptor: &MLTensorDescriptor,
+        gpu_resource_import: GpuBufferImport,
+    ) -> Result<MLTensor> {
+        if self.gpu_device.is_none() {
+            return Err(crate::error::Error::MLContextWithoutGpu);
+        }
+        let tensor = self
+            .backend
+            .create_exportable_tensor_from_graphics_import(descriptor, gpu_resource_import)?;
+        tracing::debug!(tensor_id = tensor.id);
+        self.tensor_state.push(TensorState {
+            export_state: TensorExportState::OwnedByMLContext,
+        });
+        Ok(tensor)
+    }
+
+    /// TODO: docs
+    pub fn export_to_gpu(&mut self, tensor: &MLTensor) -> Result<ExportedGpuBuffer> {
+        if self.gpu_device.is_none() {
+            return Err(crate::error::Error::MLContextWithoutGpu);
+        }
+
+        self.ensure_tensor_exportable(tensor)?;
+        let export = self.backend.export_to_gpu(tensor)?;
+        self.tensor_state[tensor.id].export_state = TensorExportState::ExportedToGraphics;
+        Ok(export)
+    }
+
+    /// TODO: docs
+    pub fn destroy_gpu_buffer(&mut self, gpu_buffer: ExportedGpuBuffer) -> Result<()> {
+        if self.gpu_device.is_none() {
+            return Err(crate::error::Error::MLContextWithoutGpu);
+        }
+        assert!(
+            self.tensor_state[gpu_buffer.tensor_id].export_state
+                == TensorExportState::ExportedToGraphics
+        );
+        self.tensor_state[gpu_buffer.tensor_id].export_state = TensorExportState::OwnedByMLContext;
+        self.backend.destroy_gpu_buffer(gpu_buffer)
     }
 
     /// Not implemented: dropping the context releases it. <https://www.w3.org/TR/webnn/#api-mlcontext-destroy>
@@ -815,6 +1075,10 @@ impl<'context> MLContext<'context> {
     ) -> crate::error::Result<()> {
         // The span carries the bindings with their ids; only the graph is extra here.
         trace!("Dispatch {graph:?}");
+
+        for &t in inputs.values().chain(outputs.values()) {
+            self.ensure_tensor_usable_for_ml(t)?;
+        }
         //https://www.w3.org/TR/webnn/#dom-mlcontext-dispatch
         // spec: 4. If allTensors contains any duplicate items, then throw a TypeError.
         validate_unique_tensor_bindings(inputs, outputs)?;
@@ -852,6 +1116,7 @@ impl<'context> MLContext<'context> {
             "Read {} bytes from tensor {tensor:?}",
             std::mem::size_of_val(array)
         );
+        self.ensure_tensor_usable_for_ml(tensor)?;
         if !tensor.readable() {
             return Err(Error::ReadToNonReadableTensor {
                 tensor: tensor.clone(),
@@ -887,6 +1152,7 @@ impl<'context> MLContext<'context> {
             "Write {} bytes to tensor {tensor:?}",
             std::mem::size_of_val(array)
         );
+        self.ensure_tensor_usable_for_ml(tensor)?;
         if !tensor.writable() {
             return Err(Error::WriteToNonWritableTensor {
                 tensor: tensor.clone(),
@@ -956,46 +1222,41 @@ impl<'context> MLContext<'context> {
     pub fn rustnn_backend_statistics(&self) -> Option<BackendStatistics> {
         self.backend.backend_statistics()
     }
+
+    fn ensure_tensor_exportable(&self, tensor: &MLTensor) -> Result<()> {
+        match self.tensor_state[tensor.id].export_state {
+            TensorExportState::NotExportable => Err(crate::error::Error::TensorNotExportable {
+                tensor: tensor.clone().into(),
+            }),
+            TensorExportState::OwnedByMLContext => Ok(()),
+            TensorExportState::ExportedToGraphics => {
+                Err(crate::error::Error::ExportableTensorAlreadyExported {
+                    tensor: tensor.clone().into(),
+                })
+            }
+            TensorExportState::Destroyed => Err(crate::error::Error::TensorDestroyed {
+                tensor: tensor.clone().into(),
+            }),
+        }
+    }
+    fn ensure_tensor_usable_for_ml(&self, tensor: &MLTensor) -> Result<()> {
+        match self.tensor_state[tensor.id].export_state {
+            TensorExportState::NotExportable | TensorExportState::OwnedByMLContext => Ok(()),
+            TensorExportState::ExportedToGraphics => {
+                Err(crate::error::Error::ExportedTensorCannotBeUsedForML {
+                    tensor: tensor.clone().into(),
+                })
+            }
+            TensorExportState::Destroyed => Err(crate::error::Error::TensorDestroyed {
+                tensor: tensor.clone().into(),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
 mod test {
     use crate::{mlcontext::*, mlgraphbuilder::MLGraphBuilder, webnn_json::from_graph_json};
-
-    #[test]
-    fn capacity_shrink_is_rejected_before_calling_any_backend() {
-        let mut context = MLContext {
-            bypass_allowed_data_types_checks: false,
-            allow_int4_uint4: false,
-            // All mutation methods panic, so reaching it would fail this test.
-            backend: Box::new(crate::backends::DisabledContext {}),
-            device: BackendDevice::LiteRt {
-                device_type: DeviceType::Cpu,
-            },
-        };
-        let mut tensor = MLTensor {
-            id: 0,
-            constant: false,
-            descriptor: MLTensorDescriptor::new(MLOperandDataType::Float32, vec![2, 3]),
-        };
-        let error = context
-            .rustnn_set_tensor_capacity(&mut tensor, &[2])
-            .unwrap_err();
-        std::assert_matches!(error, Error::TensorCapacityError {
-            requested_shape, current_shape, requested_bytes: 8, required_bytes: 24,
-        } if requested_shape == [2] && current_shape == [2, 3]);
-        assert_eq!(tensor.shape(), [2, 3]);
-        tensor.descriptor.set_shape(vec![0]);
-        std::assert_matches!(
-            context.rustnn_set_tensor_capacity(&mut tensor, &[0]),
-            Err(Error::TensorCapacityError {
-                requested_bytes: 0,
-                required_bytes: 4,
-                ..
-            })
-        );
-        assert_eq!(tensor.shape(), [0]);
-    }
 
     #[test]
     fn capacity_byte_counts_handle_scalars_packed_types_and_overflow() {
@@ -1014,42 +1275,6 @@ mod test {
         for shape in [&[u64::MAX, 2][..], &[u64::MAX][..]] {
             assert!(checked_tensor_capacity_bytes(MLOperandDataType::Float32, shape).is_err());
         }
-    }
-
-    #[test]
-    fn capacity_overflow_is_rejected_before_calling_any_backend() {
-        let mut context = MLContext {
-            bypass_allowed_data_types_checks: false,
-            allow_int4_uint4: false,
-            backend: Box::new(crate::backends::DisabledContext {}),
-            device: BackendDevice::LiteRt {
-                device_type: DeviceType::Cpu,
-            },
-        };
-        let mut tensor = MLTensor {
-            id: 0,
-            constant: false,
-            descriptor: MLTensorDescriptor::new(MLOperandDataType::Float32, vec![]),
-        };
-        assert!(matches!(
-            context.rustnn_set_tensor_capacity(&mut tensor, &[u64::MAX]),
-            Err(Error::GraphDispatchError { .. })
-        ));
-        assert!(tensor.shape().is_empty());
-    }
-
-    #[test]
-    fn backend_statistics_are_optional() {
-        // This backend uses the default trait method, without a runtime dependency.
-        let context = MLContext {
-            bypass_allowed_data_types_checks: false,
-            allow_int4_uint4: false,
-            backend: Box::new(crate::backends::DisabledContext {}),
-            device: BackendDevice::LiteRt {
-                device_type: DeviceType::Cpu,
-            },
-        };
-        assert_eq!(context.rustnn_backend_statistics(), None);
     }
 
     #[test]
