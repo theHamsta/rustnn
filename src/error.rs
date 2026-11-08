@@ -441,8 +441,8 @@ pub enum Error {
     },
 
     /// No ML device for requested GPU
-    #[error("No ML device for requested GPU")]
-    NoMlDeviceForRequestedGpu,
+    #[error("No ML device for requested GPU ({gpu:?})")]
+    NoMlDeviceForRequestedGpu{gpu: String},
 }
 
 /// Error for failed validation on a `quantizeLinear`/`dequantizeLinear` operation

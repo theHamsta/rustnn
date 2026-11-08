@@ -367,12 +367,15 @@ pub(crate) fn select_backend_by_gpu(gpu_device: &GpuDevice) -> Result<BackendDev
     match gpu_device {
         #[cfg(feature = "trtx-runtime")]
         GpuDevice::CudaDevice(cuda_context) => Ok(BackendDevice::Trtx {
-            cuda_device_idx: cuda_context
-                .cu_device()
-                .try_into()
-                .map_err(|_| crate::error::Error::NoMlDeviceForRequestedGpu)?,
+            cuda_device_idx: cuda_context.cu_device().try_into().map_err(|_| {
+                crate::error::Error::NoMlDeviceForRequestedGpu {
+                    gpu: format!("{gpu_device:?}"),
+                }
+            })?,
         }),
         GpuDevice::WgpuDevice(_device) => todo!(),
-        _ => Err(crate::error::Error::NoMlDeviceForRequestedGpu),
+        _ => Err(crate::error::Error::NoMlDeviceForRequestedGpu {
+            gpu: format!("{gpu_device:?}"),
+        }),
     }
 }
