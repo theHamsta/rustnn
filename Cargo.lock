@@ -4353,6 +4353,7 @@ name = "rustnn"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "ash",
  "base64 0.23.1",
  "block",
  "burn-ndarray",
@@ -4406,6 +4407,7 @@ dependencies = [
  "webnn-graph",
  "webnn-onnx-utils",
  "wgpu 30.0.1",
+ "windows",
  "zstd 0.14.3",
 ]
 

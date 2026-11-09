@@ -255,6 +255,10 @@ pub enum GraphBuilderError {
 #[derive(Debug, Error)]
 #[allow(missing_docs)]
 pub enum Error {
+    /// Native graphics/CUDA interop is unsupported or an ownership handoff failed.
+    /// After a failed handoff, discard the context and its exported buffers.
+    #[error("GPU interoperability: {0}")]
+    GpuInterop(String),
     /// No backend is available for context creation.
     #[error("No backend is available for context creation")]
     NoBackendAvailable {
@@ -444,7 +448,8 @@ pub enum Error {
     #[error("No ML device for requested GPU ({gpu:?})")]
     NoMlDeviceForRequestedGpu { gpu: String },
 
-    /// A MLContext that wasn't created from a [MLContext::create_from_gpu_device] can't export tensors
+    /// A context not created with [`crate::mlcontext::MLContext::create_from_gpu_device`]
+    /// cannot export tensors.
     #[error(
         "Attempted to create an exportable tensor with MLContext that wasn't created with MLContext::create_from_gpu_device"
     )]

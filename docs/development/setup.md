@@ -25,6 +25,7 @@ The default build needs no native runtime beyond the prerequisites above.
 | `onnx-runtime` | The pinned ONNX Runtime; `make onnxruntime-download` installs it and the related Make targets configure `ORT_DYLIB_PATH` |
 | `coreml-runtime` | Xcode and system CoreML on macOS/iOS; see the [CoreML guide](../integration/coreml.md) for deployment requirements and the tvOS dependency caveat |
 | `trtx-runtime`, `trtx-enterprise` | A compatible NVIDIA GPU and driver, CUDA 13.0, and a loadable TensorRT-RTX runtime |
+| `wgpu-native` with `trtx-runtime` | Vulkan on Linux/Windows or D3D12 on Windows, with exportable memory and synchronization objects; see [native wgpu interoperability](../integration/tensorrt.md#native-wgpu-interoperability) |
 | `litert-runtime` | `flatc` on `PATH` plus the native LiteRT library provisioned by `litert-sys`; WPT runs also configure its library search path |
 | `cann-runtime` | An OHOS/Ascend HiAI environment and `libcann_shim.so` (or `CANN_SHIM_PATH`) |
 | `webnn-runtime` with `webnn-wpt-tests` | The `wasm32-unknown-unknown` target; browser tests additionally need `wasm-pack`, Node.js, Chrome/Chromium, `curl`, and `unzip` |

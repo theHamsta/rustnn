@@ -97,6 +97,7 @@
 //! | `litert-runtime` | LiteRT execution through `litert` and `litert-sys` |
 //! | `burn-cpu-runtime` | Burn NdArray CPU execution (default); no native runtime library |
 //! | `trtx-runtime` | TensorRT-RTX execution, CUDA tensors and compressed engine caches |
+//! | `wgpu-native` | Native wgpu device/buffer types; with `trtx-runtime`, Linux/Windows Vulkan and Windows D3D12 share tensor memory and GPU synchronization with CUDA |
 //! | `cann-runtime` | Huawei CANN/HiAI execution on OpenHarmony |
 //! | `cann-runtime-mock` | Device-free CANN validation and placeholder conversion; no native dependencies, dispatch fails |
 //! | `webnn-runtime` | Browser WebNN graph replay and execution on `wasm32`; no serialized model converter |

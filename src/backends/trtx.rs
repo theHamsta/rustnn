@@ -17,6 +17,9 @@ use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::LazyLock;
 
+#[cfg(feature = "wgpu-native")]
+pub mod wgpu_interop;
+
 use cudarc::driver::CudaSlice;
 use cudarc::driver::CudaStream;
 use cudarc::driver::{CudaContext, DriverError, result, sys};
@@ -275,9 +278,36 @@ impl std::fmt::Debug for TrtxGraph<'_> {
 }
 
 #[derive(Debug)]
+enum TrtxMemory {
+    Cuda(CudaSlice<u8>),
+    #[cfg(feature = "wgpu-native")]
+    Shared(wgpu_interop::SharedTensor),
+}
+
+impl TrtxMemory {
+    fn num_bytes(&self) -> usize {
+        match self {
+            Self::Cuda(memory) => memory.num_bytes(),
+            #[cfg(feature = "wgpu-native")]
+            Self::Shared(memory) => memory.size,
+        }
+    }
+    fn len(&self) -> usize {
+        self.num_bytes()
+    }
+    fn ptr(&mut self, stream: &CudaStream) -> sys::CUdeviceptr {
+        match self {
+            Self::Cuda(memory) => memory.device_ptr_mut(stream).0,
+            #[cfg(feature = "wgpu-native")]
+            Self::Shared(memory) => memory.ptr(),
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct TrtxTensor {
     // todo: make all allocs owned by backend, only have view here
-    memory: CudaSlice<u8>,
+    memory: TrtxMemory,
     stream: Arc<CudaStream>,
 }
 
@@ -286,12 +316,17 @@ impl TrtxTensor {
         debug!("Allocating CUDA tensor of size {size}");
         let stream = cuda_ctx.new_stream()?;
         let memory = stream.alloc_zeros(size)?;
-        Ok(Self { memory, stream })
+        Ok(Self {
+            memory: TrtxMemory::Cuda(memory),
+            stream,
+        })
     }
 }
 
 pub(crate) struct TrtxContext<'context> {
     cuda_ctx: Arc<CudaContext>,
+    #[cfg(feature = "wgpu-native")]
+    pub(crate) wgpu: Option<wgpu_interop::InteropDevice>,
     device_cache_id: String,
     tensors: Vec<TrtxTensor>,
     events: Vec<CudaEvent>,
@@ -313,6 +348,14 @@ impl std::fmt::Debug for TrtxContext<'_> {
 }
 
 impl<'context> TrtxContext<'context> {
+    #[cfg(feature = "wgpu-native")]
+    fn list_devices_for_interop() -> Vec<u32> {
+        Self::list_devices()
+            .iter()
+            .filter_map(|device| device.as_trtx_device().copied())
+            .collect()
+    }
+
     pub(crate) fn new(cuda_device_idx: u32, options: Option<&RustNNOptions>) -> TrtxResult<Self> {
         // this retains the primary context
         Self::new_from_context(CudaContext::new(cuda_device_idx as usize)?, options)
@@ -341,6 +384,8 @@ impl<'context> TrtxContext<'context> {
         debug!("Created new TrtxContext");
         Ok(Self {
             cuda_ctx,
+            #[cfg(feature = "wgpu-native")]
+            wgpu: None,
             device_cache_id,
             tensors: vec![],
             events: vec![],
@@ -801,9 +846,16 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
             array.len(),
         );
         stream.context().bind_to_thread()?;
-        stream
-            .memcpy_dtoh(&cuda_tensor.memory, array)
-            .to_read_tensor_result(|| tensor.clone())?;
+        match &cuda_tensor.memory {
+            TrtxMemory::Cuda(memory) => stream.memcpy_dtoh(memory, array),
+            #[cfg(feature = "wgpu-native")]
+            TrtxMemory::Shared(memory) => {
+                // SAFETY: the frontend checks ownership and byte length; the tensor stream
+                // waits for the graphics handoff and inference completion.
+                unsafe { result::memcpy_dtoh_async(array, memory.ptr(), stream.cu_stream()) }
+            }
+        }
+        .to_read_tensor_result(|| tensor.clone())?;
         stream
             .synchronize()
             .to_read_tensor_result(|| tensor.clone())?;
@@ -823,9 +875,15 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
             array.as_ptr(),
             array.len(),
         );
-        stream
-            .memcpy_htod(array, &mut cuda_tensor.memory)
-            .to_write_tensor_result(|| tensor.clone())?;
+        match &mut cuda_tensor.memory {
+            TrtxMemory::Cuda(memory) => stream.memcpy_htod(array, memory),
+            #[cfg(feature = "wgpu-native")]
+            TrtxMemory::Shared(memory) => {
+                // SAFETY: ownership, size and stream ordering are validated as for reads.
+                unsafe { result::memcpy_htod_async(memory.ptr(), array, stream.cu_stream()) }
+            }
+        }
+        .to_write_tensor_result(|| tensor.clone())?;
         stream
             .synchronize()
             .to_write_tensor_result(|| tensor.clone())?;
@@ -858,7 +916,7 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
         for (input, tensor) in inputs.iter() {
             let cuda_tensor = &mut self.tensors[tensor.id];
 
-            let (ptr, _) = cuda_tensor.memory.device_ptr_mut(&cuda_tensor.stream);
+            let ptr = cuda_tensor.memory.ptr(&cuda_tensor.stream);
             if cuda_graphs_enabled {
                 io_pointers.push((false, (*input).to_owned(), ptr as usize));
             }
@@ -875,7 +933,7 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
         for (output, tensor) in outputs.iter() {
             let cuda_tensor = &mut self.tensors[tensor.id];
 
-            let (ptr, _) = cuda_tensor.memory.device_ptr_mut(&cuda_tensor.stream);
+            let ptr = cuda_tensor.memory.ptr(&cuda_tensor.stream);
             if cuda_graphs_enabled {
                 io_pointers.push((true, (*output).to_owned(), ptr as usize));
             }
@@ -928,7 +986,8 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
         }
         graph.inference_count = graph.inference_count.saturating_add(1);
         let inference_done = inference_stream.record_event(None).to_dispatch_result()?;
-        for tensor in outputs.values() {
+        // Inputs must also wait for inference to finish before export or reuse can overwrite them.
+        for tensor in inputs.values().chain(outputs.values()) {
             let cuda_tensor = &mut self.tensors[tensor.id];
             cuda_tensor
                 .stream
@@ -955,9 +1014,17 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
             tensor.descriptor.shape()
         );
 
+        #[cfg(feature = "wgpu-native")]
+        if matches!(&cuda_tensor.memory, TrtxMemory::Shared(_))
+            && new_bytes > cuda_tensor.memory.num_bytes()
+        {
+            return Err(Error::GpuInterop(
+                "shared tensors have fixed capacity".into(),
+            ));
+        }
         if new_bytes > cuda_tensor.memory.num_bytes() {
             debug!("Need to reallocate for new size {new_bytes} bytes");
-            cuda_tensor.memory = unsafe { cuda_tensor.stream.alloc(new_bytes)? }
+            cuda_tensor.memory = TrtxMemory::Cuda(unsafe { cuda_tensor.stream.alloc(new_bytes)? })
         }
         tensor.descriptor = new_desc;
         Ok(())
@@ -982,14 +1049,34 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
         }
 
         let cuda_tensor = &mut self.tensors[tensor.id];
-        cuda_tensor.memory = unsafe { cuda_tensor.stream.alloc(new_bytes)? };
+        #[cfg(feature = "wgpu-native")]
+        if matches!(&cuda_tensor.memory, TrtxMemory::Shared(_)) {
+            return Err(Error::GpuInterop(
+                "shared tensor capacity cannot be replaced".into(),
+            ));
+        }
+        cuda_tensor.memory = TrtxMemory::Cuda(unsafe { cuda_tensor.stream.alloc(new_bytes)? });
         Ok(())
     }
 
     fn create_exportable_tensor(
         &mut self,
         descriptor: &crate::mlcontext::MLTensorDescriptor,
+        _gpu_device: &GpuDevice
     ) -> crate::error::Result<MLTensor> {
+        #[cfg(feature = "wgpu-native")]
+        if let Some(device) = &self.wgpu {
+            let memory = device.allocate(&self.cuda_ctx, descriptor.rustnn_required_bytes())?;
+            self.tensors.push(TrtxTensor {
+                memory: TrtxMemory::Shared(memory),
+                stream: self.cuda_ctx.new_stream()?,
+            });
+            return Ok(MLTensor {
+                id: self.tensors.len() - 1,
+                constant: false,
+                descriptor: descriptor.clone(),
+            });
+        }
         self.create_tensor(descriptor)
     }
 
@@ -997,10 +1084,9 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
         &mut self,
         descriptor: &crate::mlcontext::MLTensorDescriptor,
         gpu_resource_import: crate::mlcontext::GpuBufferImport,
+        _gpu_device: &GpuDevice
     ) -> crate::error::Result<MLTensor> {
-        panic!(
-            "Backends that don't implment this method should allow to be created from a GPUDevice. This method is only called when a context was created from a GPUDevice"
-        )
+        Err(Error::GpuInterop("external graphics resource imports are not implemented; create an exportable tensor on the associated device".into()))
     }
 
     fn export_to_gpu(
@@ -1009,15 +1095,19 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
         gpu_device: &GpuDevice,
     ) -> crate::error::Result<crate::mlcontext::ExportedGpuBuffer> {
         let backend_tensor = &mut self.tensors[tensor.id];
-        // TODO: if this was not a normal TrtxTensor, but one of a special tensor storage like in
-        // the weightless build PR, then we would export not a CUDA tensor, but the handles that
-        // they originally gave use to import the CUDA memory, together with fence counts that need
-        // to be waited for by graphics. We expect graphics to also set the fence counts they expect
-        // us to wait on when they destroy the ExportedGpuBuffer
-        let ptr = backend_tensor
-            .memory
-            .device_ptr_mut(&backend_tensor.stream)
-            .0;
+        #[cfg(feature = "wgpu-native")]
+        if let TrtxMemory::Shared(memory) = &mut backend_tensor.memory {
+            memory.export(&backend_tensor.stream)?;
+            return Ok(ExportedGpuBuffer {
+                gpu_buffer: crate::mlcontext::GpuBuffer::WgpuBuffer {
+                    buffer: crate::mlcontext::WgpuBuffer {
+                        buffer: memory.buffer.clone(),
+                    },
+                },
+                tensor_id: tensor.id,
+            });
+        }
+        let ptr = backend_tensor.memory.ptr(&backend_tensor.stream);
         let len = backend_tensor.memory.len();
         Ok(ExportedGpuBuffer {
             gpu_buffer: crate::mlcontext::GpuBuffer::CudaBuffer(CudaBuffer {
@@ -1033,11 +1123,20 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
         &mut self,
         gpu_buffer: crate::mlcontext::ExportedGpuBuffer,
     ) -> crate::error::Result<()> {
-        // no op: this will consume the users view to use it for graphics. The frontend will mark
-        // the tensor as useable for ML operations again and we already respect the CUDA stream
-        // timeline of our tensors. We would need to do the same for other kinds of imported tensors.
-        // For ID3D12 shared fences (or vulkan timeline semaphores shared as shared fences), we
-        // would need to read the users fence count they want us to wait on for reading or writing
+        #[cfg(feature = "wgpu-native")]
+        {
+            let tensor = &mut self.tensors[gpu_buffer.tensor_id];
+            if let TrtxMemory::Shared(memory) = &mut tensor.memory {
+                if !matches!(&gpu_buffer.gpu_buffer, crate::mlcontext::GpuBuffer::WgpuBuffer { buffer } if buffer.buffer == memory.buffer)
+                {
+                    return Err(Error::GpuInterop(
+                        "returned buffer does not belong to this tensor".into(),
+                    ));
+                }
+                memory.reclaim(&tensor.stream)?;
+            }
+        }
+        // CUDA exports already share their tensor stream; wgpu handoffs were enqueued above.
         Ok(())
     }
 }
@@ -1106,16 +1205,14 @@ pub(crate) fn select_backend_device_by_gpu(gpu_device: &GpuDevice) -> Option<Bac
         GpuDevice::CudaDevice(cuda_context) => Some(BackendDevice::Trtx {
             cuda_device_idx: cuda_context.cu_device().try_into().ok()?,
         }),
-        // TODO: we can interop with WgpuDevice if
-        // - it is as_hal a d3d12 device and even better if that device is a Nvida Gpu. It can then
-        // create sharable resources and shareable fences
-        // - it is as_hal a vulkan device with feature https://docs.rs/wgpu/latest/wgpu/struct.Features.html#associatedconstant.VULKAN_EXTERNAL_MEMORY_WIN32 or https://docs.rs/wgpu/latest/wgpu/struct.Features.html#associatedconstant.VULKAN_EXTERNAL_MEMORY_FD (VULKAN_EXTERNAL_MEMORY_DMA_BUF not yet
-        // ideal for cuda import). Don't know yet how external semaphores are supported (might need
-        // to force sync or create wgpu::Device manually from own Vulkan device)
-        //
-        // In any case we would need to create shareable buffers via
-        // https://docs.rs/wgpu/latest/wgpu/struct.Device.html#method.create_buffer_from_hal
-        GpuDevice::WgpuDevice(_device) => todo!(),
+        #[cfg(feature = "wgpu-native")]
+        GpuDevice::WgpuDevice(gpu) => {
+            let interop =
+                wgpu_interop::InteropDevice::new(gpu.device.clone(), gpu.queue.clone()).ok()?;
+            Some(BackendDevice::Trtx {
+                cuda_device_idx: interop.cuda_device().ok()?,
+            })
+        }
         _ => None, // TODO
     }
 }

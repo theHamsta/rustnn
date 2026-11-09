@@ -20,6 +20,11 @@
 //! Explicit backend hints restrict selection to that backend. When nothing
 //! matches, creation fails with [`crate::error::Error::NoBackendAvailable`] (or the
 //! `ForBackendHint` variant), which lists the wanted and compiled backends.
+//!
+//! Native wgpu contexts (`wgpu-native` and `trtx-runtime`) select the CUDA device
+//! matching Vulkan's device UUID on Linux/Windows or D3D12's adapter LUID on Windows.
+//! Graphics and CUDA enumeration indices are independent. Unsupported devices or
+//! missing external memory/semaphore capabilities fail context creation.
 
 #[cfg(feature = "onnx-runtime")]
 use crate::executors::onnx::ensure_ort_initialized;

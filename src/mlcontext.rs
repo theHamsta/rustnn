@@ -125,7 +125,7 @@ pub(crate) trait MLBackendContext<'context>: std::fmt::Debug + Send + Sync {
 
     // GPU interop
 
-    fn create_exportable_tensor(&mut self, descriptor: &MLTensorDescriptor) -> Result<MLTensor> {
+    fn create_exportable_tensor(&mut self, descriptor: &MLTensorDescriptor, gpu_device: &GpuDevice) -> Result<MLTensor> {
         panic!(
             "Backends that don't implment this method should allow to be created from a GPUDevice. This method is only called when a context was created from a GPUDevice"
         )
@@ -134,12 +134,17 @@ pub(crate) trait MLBackendContext<'context>: std::fmt::Debug + Send + Sync {
         &mut self,
         descriptor: &MLTensorDescriptor,
         gpu_resource_import: GpuBufferImport,
+        gpu_device: &GpuDevice,
     ) -> Result<MLTensor> {
         panic!(
             "Backends that don't implment this method should allow to be created from a GPUDevice. This method is only called when a context was created from a GPUDevice"
         )
     }
-    fn export_to_gpu(&mut self, tensor: &MLTensor, gpu_device: &GpuDevice) -> Result<ExportedGpuBuffer> {
+    fn export_to_gpu(
+        &mut self,
+        tensor: &MLTensor,
+        gpu_device: &GpuDevice,
+    ) -> Result<ExportedGpuBuffer> {
         panic!(
             "Backends that don't implment this method should allow to be created from a GPUDevice. This method is only called when a context was created from a GPUDevice"
         )
@@ -217,7 +222,8 @@ impl<'context> MLBackendGraph<'context> {
 
 // types for MLContext
 
-/// Placeholder for the WebGPU device of `ML.createContext(GPUDevice)`; not implemented yet.
+/// GPU identity for context creation. CUDA and native wgpu devices support tensor interop;
+/// the other variants are reserved for future graphics imports.
 // aka WebGpuDevice
 #[derive(Debug, Clone)]
 #[allow(missing_docs)]
@@ -227,8 +233,8 @@ pub enum GpuDevice {
     /// from CUDA context
     CudaDevice(std::sync::Arc<cudarc::driver::CudaContext>),
     #[cfg(feature = "wgpu-native")]
-    /// from wgpu device
-    WgpuDevice(wgpu::Device),
+    /// Native wgpu device and its queue. Requires `trtx-runtime` for execution.
+    WgpuDevice(WgpuDevice),
     /// from WebGPU device when running in a browser context
     WebGPUDevice {/*...*/},
     /// from a Windows adapter (create new GPU context with the intention to import shareable resources e.g. cross process)
@@ -289,13 +295,44 @@ pub struct CudaBuffer {
     pub stream: Arc<cudarc::driver::CudaStream>,
 }
 
+/// A native wgpu device and queue used for CUDA interoperability.
+#[cfg(feature = "wgpu-native")]
+#[derive(Debug, Clone)]
+pub struct WgpuDevice {
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
+}
+
+#[cfg(feature = "wgpu-native")]
+impl WgpuDevice {
+    /// Associate a device with its queue for native interop.
+    ///
+    /// # Safety
+    /// `queue` must belong to `device`. Serialize all submissions on this queue with
+    /// context creation, export, return and context destruction, including submissions
+    /// from other threads and clones. Native interop submits ownership barriers directly.
+    /// Vulkan devices must have timeline semaphore support enabled at device creation;
+    /// use the TensorRT backend's `create_vulkan_device` helper when creating them.
+    pub unsafe fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        Self { device, queue }
+    }
+}
+
+/// A graphics view of a shared tensor. Use [`GpuBuffer::as_wgpu_buffer`] to access it
+/// under its unsafe ownership contract.
+#[cfg(feature = "wgpu-native")]
+#[derive(Debug)]
+pub struct WgpuBuffer {
+    pub(crate) buffer: wgpu::Buffer,
+}
+
 #[derive(Debug)]
 #[allow(missing_docs)]
 pub enum GpuBuffer {
     #[cfg(feature = "trtx-runtime")]
     CudaBuffer(CudaBuffer),
     #[cfg(feature = "wgpu-native")]
-    WgpuBuffer { buffer: wgpu::Buffer },
+    WgpuBuffer { buffer: WgpuBuffer },
 }
 
 #[derive(Debug)]
@@ -329,7 +366,7 @@ impl GpuBuffer {
     #[cfg(feature = "trtx-runtime")]
     /// Returns `true` if the exported gpu buffer is [`CudaBuffer`].
     ///
-    /// [`CudaBuffer`]: ExportedGpuBuffer::CudaBuffer
+    /// [`CudaBuffer`]: GpuBuffer::CudaBuffer
     #[must_use]
     pub fn is_cuda_buffer(&self) -> bool {
         matches!(self, Self::CudaBuffer { .. })
@@ -338,39 +375,45 @@ impl GpuBuffer {
     #[cfg(feature = "trtx-runtime")]
     /// Returns a reference to a [CudaBuffer] if the exported buffer is of that variant
     pub fn as_cuda_buffer(&self) -> Option<&CudaBuffer> {
-        if let Self::CudaBuffer(buffer) = self {
-            Some(buffer)
-        } else {
-            None
+        match self {
+            Self::CudaBuffer(buffer) => Some(buffer),
+            #[cfg(feature = "wgpu-native")]
+            _ => None,
         }
     }
 
     #[cfg(feature = "trtx-runtime")]
     /// Returns a reference to a [CudaBuffer] if the exported buffer is of that variant
     pub fn as_cuda_buffer_mut(&mut self) -> Option<&mut CudaBuffer> {
-        if let Self::CudaBuffer(buffer) = self {
-            Some(buffer)
-        } else {
-            None
+        match self {
+            Self::CudaBuffer(buffer) => Some(buffer),
+            #[cfg(feature = "wgpu-native")]
+            _ => None,
         }
     }
 
     #[cfg(feature = "wgpu-native")]
     /// Returns `true` if the exported gpu buffer is [`WgpuBuffer`].
     ///
-    /// [`WgpuBuffer`]: ExportedGpuBuffer::WgpuBuffer
+    /// [`WgpuBuffer`]: GpuBuffer::WgpuBuffer
     #[must_use]
     pub fn is_wgpu_buffer(&self) -> bool {
         matches!(self, Self::WgpuBuffer { .. })
     }
 
     #[cfg(feature = "wgpu-native")]
-    /// Returns a reference to a [wgpu::Buffer] if the exported buffer is of that variant
-    pub fn as_wgpu_buffer(&self) -> Option<&wgpu::Buffer> {
-        if let Self::WgpuBuffer { buffer } = self {
-            Some(buffer)
-        } else {
-            None
+    /// Returns the shared wgpu buffer while graphics owns this export.
+    ///
+    /// # Safety
+    /// Submit all uses on the context's graphics queue before returning this export to ML.
+    /// Do not use retained buffers, bind groups or command buffers after returning ownership.
+    /// Do not call `Buffer::destroy` on the shared buffer. Serialize queue submissions
+    /// with context operations as required by [`WgpuDevice::new`].
+    pub unsafe fn as_wgpu_buffer(&self) -> Option<&wgpu::Buffer> {
+        match self {
+            Self::WgpuBuffer { buffer } => Some(&buffer.buffer),
+            #[cfg(feature = "trtx-runtime")]
+            _ => None,
         }
     }
 }
@@ -866,9 +909,18 @@ impl<'context> MLContext<'context> {
         })
     }
 
-    /// Not implemented: `ML.createContext(GPUDevice)`.
+    /// Create a context sharing the supplied CUDA or native wgpu device.
     ///async
     pub fn create_from_gpu_device(gpu_device: GpuDevice, options: RustNNOptions) -> Result<Self> {
+        #[cfg(all(feature = "trtx-runtime", feature = "wgpu-native"))]
+        if let GpuDevice::WgpuDevice(gpu) = &gpu_device {
+            // Report missing extensions or device identity failures before generic selection
+            // turns them into NoMlDeviceForRequestedGpu.
+            crate::backends::trtx::wgpu_interop::InteropDevice::new(
+                gpu.device.clone(),
+                gpu.queue.clone(),
+            )?;
+        }
         let backend_device = select_backend_device_by_gpu(&gpu_device)?;
         let backend: Box<dyn MLBackendContext> = match (backend_device, &gpu_device) {
             #[cfg(feature = "trtx-runtime")]
@@ -879,6 +931,18 @@ impl<'context> MLContext<'context> {
                 Arc::clone(cuda_ctx),
                 Some(&options),
             )?),
+            #[cfg(all(feature = "trtx-runtime", feature = "wgpu-native"))]
+            (
+                crate::backend_selection::BackendDevice::Trtx { cuda_device_idx },
+                GpuDevice::WgpuDevice(gpu),
+            ) => {
+                let mut backend = TrtxContext::new(cuda_device_idx, Some(&options))?;
+                backend.wgpu = Some(crate::backends::trtx::wgpu_interop::InteropDevice::new(
+                    gpu.device.clone(),
+                    gpu.queue.clone(),
+                )?);
+                Box::new(backend)
+            }
             _ => unreachable!(
                 "When a backend device is selected, the backend must also support being constructed with that GpuDevice"
             ),
@@ -940,12 +1004,16 @@ impl<'context> MLContext<'context> {
         Ok(tensor)
     }
 
-    /// Creates an MLTensor associated with this MLContext which may be exported to the given GPUDevice using [MLContext::export_to_gpu]
+    /// Create a tensor that can temporarily transfer ownership to this context's GPU device.
     ///
     /// This function only works when the MLContext can create the needed graphics resource which is
-    /// the case for CUDA, wgpu and WebGPU. For other cases use [create_exportable_tensor_from_graphics_import]
+    /// the case for CUDA, wgpu and WebGPU. For other cases use [Self::create_exportable_tensor_from_graphics_import]
     ///
-    /// See https://www.w3.org/TR/webnn/#dom-mlcontext-createexportabletensor
+    /// Native wgpu tensors use fixed-capacity shared allocations. Only storage-buffer and
+    /// copy usages are exposed; they cannot be mapped by wgpu. Allocation initializes the
+    /// complete graphics-visible buffer, including alignment padding.
+    ///
+    /// See <https://www.w3.org/TR/webnn/#dom-mlcontext-createexportabletensor>.
     #[tracing::instrument(
         skip_all,
         err,
@@ -961,10 +1029,10 @@ impl<'context> MLContext<'context> {
         &mut self,
         descriptor: &MLTensorDescriptor,
     ) -> Result<MLTensor> {
-        if self.gpu_device.is_none() {
+        let Some(gpu_device) = &self.gpu_device else {
             return Err(crate::error::Error::MLContextWithoutGpu);
-        }
-        let tensor = self.backend.create_exportable_tensor(descriptor)?;
+        };
+        let tensor = self.backend.create_exportable_tensor(descriptor, gpu_device)?;
         tracing::debug!(tensor_id = tensor.id);
         self.tensor_state.push(TensorState {
             export_state: TensorExportState::OwnedByMLContext,
@@ -972,9 +1040,10 @@ impl<'context> MLContext<'context> {
         Ok(tensor)
     }
 
-    /// Like [create_exportable_tensor] but for situations where the MLContext can't create the
+    /// Like [Self::create_exportable_tensor] but for situations where the MLContext can't create the
     /// graphics resource itself. This is for instance the case if the graphics context is running
-    /// in a different context.
+    /// in a different process than the ML context but also when graphics needs full control over their
+    /// allocations.
     ///
     /// In a addition to a [MLTensorDescriptor] for the tensor to be created provide a GPUDevice
     ///
@@ -995,12 +1064,12 @@ impl<'context> MLContext<'context> {
         descriptor: &MLTensorDescriptor,
         gpu_resource_import: GpuBufferImport,
     ) -> Result<MLTensor> {
-        if self.gpu_device.is_none() {
+        let Some(gpu_device) = &self.gpu_device else {
             return Err(crate::error::Error::MLContextWithoutGpu);
-        }
+        };
         let tensor = self
             .backend
-            .create_exportable_tensor_from_graphics_import(descriptor, gpu_resource_import)?;
+            .create_exportable_tensor_from_graphics_import(descriptor, gpu_resource_import, gpu_device)?;
         tracing::debug!(tensor_id = tensor.id);
         self.tensor_state.push(TensorState {
             export_state: TensorExportState::OwnedByMLContext,
@@ -1008,7 +1077,11 @@ impl<'context> MLContext<'context> {
         Ok(tensor)
     }
 
-    /// TODO: docs
+    /// Transfer exclusive tensor access from ML to graphics.
+    ///
+    /// Native wgpu exports signal CUDA completion and submit a graphics queue wait and
+    /// ownership acquire. This includes outstanding inference reads of input tensors.
+    /// ML reads, writes, dispatch and resize reject this tensor until it is returned.
     pub fn export_to_gpu(&mut self, tensor: &MLTensor) -> Result<ExportedGpuBuffer> {
         let Some(gpu_device) = &self.gpu_device else {
             return Err(crate::error::Error::MLContextWithoutGpu);
@@ -1020,7 +1093,11 @@ impl<'context> MLContext<'context> {
         Ok(export)
     }
 
-    /// TODO: docs
+    /// Return an exported buffer to ML after submitting all graphics uses.
+    ///
+    /// Native wgpu returns flush pending uploads, release graphics ownership and enqueue
+    /// a CUDA wait on a shared timeline semaphore or fence. No CPU wait is needed for
+    /// normal handoffs. Discard the context if a handoff fails; ownership is not restored.
     pub fn destroy_gpu_buffer(&mut self, gpu_buffer: ExportedGpuBuffer) -> Result<()> {
         if self.gpu_device.is_none() {
             return Err(crate::error::Error::MLContextWithoutGpu);
@@ -1029,8 +1106,10 @@ impl<'context> MLContext<'context> {
             self.tensor_state[gpu_buffer.tensor_id].export_state
                 == TensorExportState::ExportedToGraphics
         );
-        self.tensor_state[gpu_buffer.tensor_id].export_state = TensorExportState::OwnedByMLContext;
-        self.backend.destroy_gpu_buffer(gpu_buffer)
+        let tensor_id = gpu_buffer.tensor_id;
+        self.backend.destroy_gpu_buffer(gpu_buffer)?;
+        self.tensor_state[tensor_id].export_state = TensorExportState::OwnedByMLContext;
+        Ok(())
     }
 
     /// Not implemented: dropping the context releases it. <https://www.w3.org/TR/webnn/#api-mlcontext-destroy>
@@ -1179,6 +1258,7 @@ impl<'context> MLContext<'context> {
     /// the `dynamic-inputs` feature). Resizing within the capacity reserved with
     /// [`Self::rustnn_set_tensor_capacity`] avoids reallocation; supported backends
     /// may grow storage when the new shape exceeds that capacity.
+    /// Shared native wgpu tensors reject growth beyond their original capacity.
     #[tracing::instrument(
         name = "resize_tensor",
         skip_all,
@@ -1187,6 +1267,7 @@ impl<'context> MLContext<'context> {
         fields(tensor_id = tensor.id, from = ?tensor.shape(), to = ?new_shape)
     )]
     pub fn rustnn_resize_tensor(&mut self, tensor: &mut MLTensor, new_shape: &[u64]) -> Result<()> {
+        self.ensure_tensor_usable_for_ml(tensor)?;
         self.backend.rustnn_resize_tensor(tensor, new_shape)
     }
 
@@ -1195,6 +1276,7 @@ impl<'context> MLContext<'context> {
     ///
     /// Returns [`Error::TensorCapacityError`] without changing the tensor if the
     /// requested capacity cannot hold its active shape, on every backend.
+    /// Shared native wgpu tensors reject capacity replacement with [`Error::GpuInterop`].
     #[tracing::instrument(
         name = "set_tensor_capacity",
         skip_all,
@@ -1207,6 +1289,7 @@ impl<'context> MLContext<'context> {
         tensor: &mut MLTensor,
         max_shape: &[u64],
     ) -> Result<()> {
+        self.ensure_tensor_usable_for_ml(tensor)?;
         let requested_bytes = checked_tensor_capacity_bytes(tensor.data_type(), max_shape)?;
         // Preserve read/write storage's one-element minimum for zero extents.
         let required_bytes = checked_tensor_capacity_bytes(tensor.data_type(), tensor.shape())?

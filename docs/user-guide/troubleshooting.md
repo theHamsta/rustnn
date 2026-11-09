@@ -12,7 +12,8 @@ lines to most of these situations.
 | `Error::NoBackendAvailableForBackendHint` | The hinted backend is compiled in but reports no device, or its library failed to load. Check the backend-specific rows below |
 | ONNX Runtime is unavailable, or initialization reports a missing library or incompatible version | Set `ORT_DYLIB_PATH` to the downloaded ONNX Runtime 1.29 or newer shared library and restart the process. rustnn uses `ort::init_from` to return loading errors; backend discovery skips an unavailable runtime. An old `onnxruntime.dll` in Windows `System32` can be selected if the variable is unset. See [Getting Started](getting-started.md#provide-onnx-runtime) |
 | ONNX Runtime repeats the same initialization error after fixing `ORT_DYLIB_PATH` | Initialization failures are cached for the process lifetime. Restart the process after fixing the library path |
-| TensorRT-RTX not selected, log shows a library load error (`LoadLibraryExW` code 126 on Windows) | `tensorrt_rtx_1_6` is not on `PATH` / `LD_LIBRARY_PATH`; add the SDK library directory or call `dynamically_load_tensorrt` |
+| TensorRT-RTX not selected, log shows a library load error (`LoadLibraryExW` code 126 on Windows) | The TensorRT-RTX library is not on `PATH` / `LD_LIBRARY_PATH`; add the SDK library directory or call `dynamically_load_tensorrt` |
+| `Error::GpuInterop` during wgpu context creation | Use a supported NVIDIA device and match graphics/CUDA identity. On Linux create the device with `create_vulkan_device`; external memory and exportable timeline semaphore support are both required. See [TensorRT interop](../integration/tensorrt.md#native-wgpu-interoperability) |
 | CANN never selected | By design; pass `with_rustnn_backend_hint(Backend::Cann)` |
 
 ## Building graphs
@@ -41,6 +42,7 @@ lines to most of these situations.
 | `Error::WrongWriteSize` / `WrongReadSize` | The host buffer must hold exactly `tensor.rustnn_required_bytes()` bytes |
 | `Error::WriteToNonWritableTensor` / `ReadToNonReadableTensor` | Create the tensor with `to_writable()` or `to_readable()` |
 | `Error::TensorCapacityError` | `rustnn_set_tensor_capacity` requested less storage than the active shape. Resize it first; rejection leaves shape and values unchanged on every backend |
+| `Error::GpuInterop` during shared tensor resize or handoff | Shared tensors have fixed capacity. Return graphics ownership before ML access; growth and capacity replacement are rejected. Discard the context after a failed handoff |
 | Wrong results after editing a converter (TensorRT) | A cached engine from before the edit is unlikely (the cache key includes the converter sources) but possible for local uncommitted files; delete `<cache_dir>/rustnn/trtx` |
 
 ## Tests and tooling
