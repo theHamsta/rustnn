@@ -125,7 +125,11 @@ pub(crate) trait MLBackendContext<'context>: std::fmt::Debug + Send + Sync {
 
     // GPU interop
 
-    fn create_exportable_tensor(&mut self, descriptor: &MLTensorDescriptor, gpu_device: &GpuDevice) -> Result<MLTensor> {
+    fn create_exportable_tensor(
+        &mut self,
+        descriptor: &MLTensorDescriptor,
+        gpu_device: &GpuDevice,
+    ) -> Result<MLTensor> {
         panic!(
             "Backends that don't implment this method should allow to be created from a GPUDevice. This method is only called when a context was created from a GPUDevice"
         )
@@ -1032,7 +1036,9 @@ impl<'context> MLContext<'context> {
         let Some(gpu_device) = &self.gpu_device else {
             return Err(crate::error::Error::MLContextWithoutGpu);
         };
-        let tensor = self.backend.create_exportable_tensor(descriptor, gpu_device)?;
+        let tensor = self
+            .backend
+            .create_exportable_tensor(descriptor, gpu_device)?;
         tracing::debug!(tensor_id = tensor.id);
         self.tensor_state.push(TensorState {
             export_state: TensorExportState::OwnedByMLContext,
@@ -1067,9 +1073,11 @@ impl<'context> MLContext<'context> {
         let Some(gpu_device) = &self.gpu_device else {
             return Err(crate::error::Error::MLContextWithoutGpu);
         };
-        let tensor = self
-            .backend
-            .create_exportable_tensor_from_graphics_import(descriptor, gpu_resource_import, gpu_device)?;
+        let tensor = self.backend.create_exportable_tensor_from_graphics_import(
+            descriptor,
+            gpu_resource_import,
+            gpu_device,
+        )?;
         tracing::debug!(tensor_id = tensor.id);
         self.tensor_state.push(TensorState {
             export_state: TensorExportState::OwnedByMLContext,

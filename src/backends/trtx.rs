@@ -1062,7 +1062,7 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
     fn create_exportable_tensor(
         &mut self,
         descriptor: &crate::mlcontext::MLTensorDescriptor,
-        _gpu_device: &GpuDevice
+        _gpu_device: &GpuDevice,
     ) -> crate::error::Result<MLTensor> {
         #[cfg(feature = "wgpu-native")]
         if let Some(device) = &self.wgpu {
@@ -1084,7 +1084,7 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
         &mut self,
         descriptor: &crate::mlcontext::MLTensorDescriptor,
         gpu_resource_import: crate::mlcontext::GpuBufferImport,
-        _gpu_device: &GpuDevice
+        _gpu_device: &GpuDevice,
     ) -> crate::error::Result<MLTensor> {
         Err(Error::GpuInterop("external graphics resource imports are not implemented; create an exportable tensor on the associated device".into()))
     }
