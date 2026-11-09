@@ -1102,9 +1102,19 @@ impl ListDevices for TrtxContext<'_> {
 pub(crate) fn select_backend_device_by_gpu(gpu_device: &GpuDevice) -> Option<BackendDevice> {
     match gpu_device {
         #[cfg(feature = "trtx-runtime")]
+        // TODO: would need to check for Turing+ or better Ampere+ to be suitable for Trtx
         GpuDevice::CudaDevice(cuda_context) => Some(BackendDevice::Trtx {
             cuda_device_idx: cuda_context.cu_device().try_into().ok()?,
         }),
+        // TODO: we can interop with WgpuDevice if
+        // - it is as_hal a d3d12 device and even better if that device is a Nvida Gpu. It can then
+        // create sharable resources and shareable fences
+        // - it is as_hal a vulkan device with feature https://docs.rs/wgpu/latest/wgpu/struct.Features.html#associatedconstant.VULKAN_EXTERNAL_MEMORY_WIN32 or https://docs.rs/wgpu/latest/wgpu/struct.Features.html#associatedconstant.VULKAN_EXTERNAL_MEMORY_FD (VULKAN_EXTERNAL_MEMORY_DMA_BUF not yet
+        // ideal for cuda import). Don't know yet how external semaphores are supported (might need
+        // to force sync or create wgpu::Device manually from own Vulkan device)
+        //
+        // In any case we would need to create shareable buffers via
+        // https://docs.rs/wgpu/latest/wgpu/struct.Device.html#method.create_buffer_from_hal
         GpuDevice::WgpuDevice(_device) => todo!(),
         _ => None, // TODO
     }
