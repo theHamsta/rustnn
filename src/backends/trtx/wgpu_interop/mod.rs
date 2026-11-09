@@ -39,6 +39,9 @@ impl InteropDevice {
         if !unsafe { sys::is_culib_present() } {
             return Err(error("CUDA driver library is unavailable"));
         }
+        // TODO: we match DX12 via LUID, and Vulkan via UUID
+        //
+        // We could just always use device_pci_bus_id for cudaDeviceGetPCIBusId
         match self.device.adapter_info().backend {
             #[cfg(any(target_os = "linux", windows))]
             wgpu::Backend::Vulkan => vulkan::cuda_device(&self.device),
