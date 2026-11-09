@@ -56,10 +56,16 @@ fn round_trip(backend: wgpu::Backends) {
     let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     instance_descriptor.backends = backend;
     let instance = wgpu::Instance::new(instance_descriptor);
-    let adapter = pollster::block_on(instance.enumerate_adapters(backend))
+    let Some(adapter) = pollster::block_on(instance.enumerate_adapters(backend))
         .into_iter()
         .find(|a| a.get_info().vendor == 0x10de)
-        .expect("test requires an NVIDIA graphics adapter");
+    else {
+        log::warn!(
+            "skipping wgpu test because no Nvidia adapter found for wgpu backend {backend:?}"
+        );
+        return;
+    };
+
     let descriptor = wgpu::DeviceDescriptor {
         label: Some("rustnn CUDA interop test"),
         ..Default::default()
@@ -178,14 +184,12 @@ fn round_trip(backend: wgpu::Backends) {
 }
 
 #[test]
-#[ignore = "requires Vulkan, an NVIDIA CUDA GPU and TensorRT-RTX"]
 fn vulkan_cuda_trtx_round_trip() {
     round_trip(wgpu::Backends::VULKAN);
 }
 
 #[cfg(windows)]
 #[test]
-#[ignore = "requires D3D12, an NVIDIA CUDA GPU and TensorRT-RTX"]
 fn d3d12_cuda_trtx_round_trip() {
     round_trip(wgpu::Backends::DX12);
 }

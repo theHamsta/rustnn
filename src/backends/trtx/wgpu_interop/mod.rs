@@ -325,19 +325,23 @@ impl Drop for CudaExternal {
 
 #[cfg(all(test, any(target_os = "linux", windows)))]
 mod tests {
+    use log::warn;
+
     use super::*;
 
     #[test]
-    #[ignore = "requires an NVIDIA Vulkan/CUDA GPU"]
     fn vulkan_cuda_shared_buffer() {
         let _ = pretty_env_logger::try_init();
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backends = wgpu::Backends::VULKAN;
         let instance = wgpu::Instance::new(descriptor);
-        let adapter = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN))
+        let Some(adapter) = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::VULKAN))
             .into_iter()
             .find(|a| a.get_info().vendor == 0x10de)
-            .expect("NVIDIA Vulkan adapter required");
+        else {
+            warn!("Skipping because not CUDA adapter for Vulkan found");
+            return;
+        };
         let (device, queue) = create_vulkan_device(&adapter, &Default::default()).unwrap();
         let interop = InteropDevice::new(device.clone(), queue.clone()).unwrap();
         let cuda = CudaContext::new(interop.cuda_device().unwrap() as usize).unwrap();
