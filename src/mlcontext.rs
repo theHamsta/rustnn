@@ -139,7 +139,7 @@ pub(crate) trait MLBackendContext<'context>: std::fmt::Debug + Send + Sync {
             "Backends that don't implment this method should allow to be created from a GPUDevice. This method is only called when a context was created from a GPUDevice"
         )
     }
-    fn export_to_gpu(&mut self, tensor: &MLTensor) -> Result<ExportedGpuBuffer> {
+    fn export_to_gpu(&mut self, tensor: &MLTensor, gpu_device: &GpuDevice) -> Result<ExportedGpuBuffer> {
         panic!(
             "Backends that don't implment this method should allow to be created from a GPUDevice. This method is only called when a context was created from a GPUDevice"
         )
@@ -300,6 +300,11 @@ pub enum GpuBuffer {
 
 #[derive(Debug)]
 #[allow(missing_docs)]
+// TODO: should add lifetime to ensure that it can't outlive mlcontext
+// can't make this a borrow or mut-borrow of mlcontext as mut-borrow would prevent mlcontext from ml
+// actions unless they would use a shared ref of mlcontext
+//
+// could also force access to this only via unsafe
 pub struct ExportedGpuBuffer {
     pub(crate) gpu_buffer: GpuBuffer,
     pub(crate) tensor_id: usize,
@@ -1005,12 +1010,12 @@ impl<'context> MLContext<'context> {
 
     /// TODO: docs
     pub fn export_to_gpu(&mut self, tensor: &MLTensor) -> Result<ExportedGpuBuffer> {
-        if self.gpu_device.is_none() {
+        let Some(gpu_device) = &self.gpu_device else {
             return Err(crate::error::Error::MLContextWithoutGpu);
-        }
+        };
 
         self.ensure_tensor_exportable(tensor)?;
-        let export = self.backend.export_to_gpu(tensor)?;
+        let export = self.backend.export_to_gpu(tensor, gpu_device)?;
         self.tensor_state[tensor.id].export_state = TensorExportState::ExportedToGraphics;
         Ok(export)
     }

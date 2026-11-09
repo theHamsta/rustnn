@@ -1006,6 +1006,7 @@ impl<'context> MLBackendContext<'context> for TrtxContext<'context> {
     fn export_to_gpu(
         &mut self,
         tensor: &MLTensor,
+        gpu_device: &GpuDevice,
     ) -> crate::error::Result<crate::mlcontext::ExportedGpuBuffer> {
         let backend_tensor = &mut self.tensors[tensor.id];
         // TODO: if this was not a normal TrtxTensor, but one of a special tensor storage like in
