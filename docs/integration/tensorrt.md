@@ -67,7 +67,7 @@ serialized with context creation, export, return and destruction. The CUDA devic
 by Vulkan device UUID or D3D12 adapter LUID, never by enumeration index.
 
 For Vulkan on Linux or Windows, use
-[`create_vulkan_device`](https://rustnn.github.io/rustnn/api/rustnn/backends/trtx/wgpu_interop/fn.create_vulkan_device.html)
+[`WgpuDevice::create_vulkan_device`](https://rustnn.github.io/rustnn/api/rustnn/mlcontext/struct.WgpuDevice.html#method.create_vulkan_device)
 to enable the external memory and semaphore extensions: `_fd` on Linux, `_win32` on Windows.
 The helper requests `VULKAN_EXTERNAL_MEMORY_FD` or `VULKAN_EXTERNAL_MEMORY_WIN32` respectively.
 The device must support timeline semaphores and exportable storage-buffer memory and timeline
@@ -78,7 +78,11 @@ Windows uses shared D3D12 committed resources and shared fences on a single-node
 Metal, browser WebGPU and DMA-BUF imports are not implemented by this path.
 
 Use the ownership sequence below. The integration test in `tests/wgpu_trtx_interop.rs` is a
-complete example with compute shaders, TensorRT dispatch and graphics readback:
+complete example with compute shaders, TensorRT dispatch and graphics readback. For a
+windowed spinning triangle with fast style transfer and GPU presentation, run
+`cargo run --release --features wgpu-demo --example wgpu_style_transfer`; see the
+[demo guide](https://rustnn.github.io/rustnn/user-guide/examples/#windowed-graphics-interop-demo).
+The demo uses public `MLContext` and `WgpuDevice` APIs throughout:
 
 ```text
 create_exportable_tensor -> ML owns the tensor

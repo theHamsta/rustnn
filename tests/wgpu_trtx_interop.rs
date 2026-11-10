@@ -71,7 +71,7 @@ fn round_trip(backend: wgpu::Backends) {
         ..Default::default()
     };
     let (device, queue) = if backend == wgpu::Backends::VULKAN {
-        rustnn::backends::trtx::wgpu_interop::create_vulkan_device(&adapter, &descriptor).unwrap()
+        WgpuDevice::create_vulkan_device(&adapter, &descriptor).unwrap()
     } else {
         pollster::block_on(adapter.request_device(&descriptor)).unwrap()
     };

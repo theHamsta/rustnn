@@ -309,6 +309,19 @@ pub struct WgpuDevice {
 
 #[cfg(feature = "wgpu-native")]
 impl WgpuDevice {
+    /// Create a Vulkan device and queue with the external memory and semaphore
+    /// extensions required for tensor sharing. The adapter must support timeline
+    /// semaphores and opaque FD (Linux) or NT handle (Windows) exports.
+    ///
+    /// Use the returned device and queue for rendering and pass clones to [`Self::new`].
+    #[cfg(all(feature = "trtx-runtime", any(target_os = "linux", windows)))]
+    pub fn create_vulkan_device(
+        adapter: &wgpu::Adapter,
+        descriptor: &wgpu::DeviceDescriptor<'_>,
+    ) -> Result<(wgpu::Device, wgpu::Queue)> {
+        crate::backends::trtx::wgpu_interop::create_vulkan_device(adapter, descriptor)
+    }
+
     /// Associate a device with its queue for native interop.
     ///
     /// # Safety
@@ -316,7 +329,7 @@ impl WgpuDevice {
     /// context creation, export, return and context destruction, including submissions
     /// from other threads and clones. Native interop submits ownership barriers directly.
     /// Vulkan devices must have timeline semaphore support enabled at device creation;
-    /// use the TensorRT backend's `create_vulkan_device` helper when creating them.
+    /// use `WgpuDevice::create_vulkan_device` when creating them.
     pub unsafe fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
         Self { device, queue }
     }

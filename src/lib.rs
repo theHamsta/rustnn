@@ -104,6 +104,7 @@
 //! | `trtx-enterprise` | `trtx-runtime` linked against full TensorRT 10 (`nvinfer`) for validation |
 //! | `dynamic-inputs` | Enable ONNX/CoreML conversion of [`graph::Dimension::Dynamic`] shapes bounded by `max_size` |
 //! | `zstd-cache-compression` | Compress on-disk engine caches (enabled by `trtx-runtime`) |
+//! | `wgpu-demo` | Windowed spinning triangle with shared GPU tensors and fast style transfer; enables `native-examples`, `wgpu-native`, `trtx-runtime`, winit and NVTX tracing (Linux/Windows Vulkan) |
 //! | `native-examples` | Build the larger examples (`fast_style_transfer_builder_api`, `smollm_mlcontext`) |
 //! | `capi` | C API exports and logging support |
 //! | `wpt-embed-corpus` | Embed the WPT corpus for targets without filesystem access |

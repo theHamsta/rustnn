@@ -3,12 +3,13 @@
 ## Example programs
 
 The `examples/` directory contains complete programs. Build them with the features they need;
-the two largest are gated behind the `native-examples` feature so that `cargo build` stays
-fast.
+the larger model examples are gated behind the `native-examples` feature, and the windowed
+interop demo uses `wgpu-demo`.
 
 | Program | What it shows | Run |
 |---|---|---|
 | `fast_style_transfer_builder_api.rs` | Builds the fast style transfer network with the builder API (`conv2d`, `conv_transpose2d`, instance normalization with a fallback composed from reductions, `pad`), downloads the weights from the WebNN test-data repository, and pipelines inferences over pre-allocated tensors | `cargo run --release --features native-examples,onnx-runtime --example fast_style_transfer_builder_api -- --input photo.jpg --output styled.png` |
+| `wgpu_style_transfer.rs` | Opens a wgpu window, renders a spinning triangle, applies the same fast style transfer model through public `MLContext` tensor sharing, and presents the GPU output | `cargo run --release --features wgpu-demo --example wgpu_style_transfer` |
 | `smollm_mlcontext.rs` | Text generation with SmolLM-135M from an onnx2webnn export: loads `.webnn` plus weights, uses dynamic tensor shapes for the KV cache (`rustnn_set_tensor_capacity`, `rustnn_resize_tensor`) and a tokenizer | `cargo run --release --features native-examples,onnx-runtime,dynamic-inputs --example smollm_mlcontext -- --model model.webnn --tokenizer tokenizer.json --max-new-tokens 32` |
 | `resnet50_webnn_rust.rs` | ResNet-50 classification and a latency benchmark from a `.webnn` export, with ImageNet preprocessing of a JPEG or PNG input | `cargo run --release --features onnx-runtime --example resnet50_webnn_rust -- --model resnet50_Opset16.webnn --input cat.jpg --labels examples/imagenet_classes.txt --bench` |
 | `gpt2_webnn_rust.rs` | Older generation loops built on the legacy executor path (`ConverterRegistry` plus `run_onnx_with_inputs`) instead of `MLContext` |  |
@@ -34,6 +35,41 @@ Other files in `examples/`:
 - `imagenet_classes.txt`, `images/test.jpg`, `sample_text.txt`: inputs for the examples.
 - `experimental/*.py`: Python scripts that run the exported ONNX models through ONNX Runtime
   for parity checks. They do not use rustnn.
+
+## Windowed graphics interop demo
+
+`examples/wgpu_style_transfer.rs` requires Linux or Windows, an NVIDIA Vulkan adapter that
+can present to the desktop, and the TensorRT-RTX runtime. Set up the runtime as described in
+[TensorRT-RTX integration](../integration/tensorrt.md), then run:
+
+```bash
+cargo run --release --features wgpu-demo --example wgpu_style_transfer -- --model starry-night
+```
+
+Use `--model bedroom` (or another style listed by `--help`) to change the model, and
+`--weights-base-url` to use a different HTTP weight source. The weights are downloaded at
+startup. Graph compilation and warmup finish before animation starts. Close the window or
+press Escape to exit; `--frames 120` exits automatically after presenting that many frames.
+
+The scene renders at the model's fixed 540 by 540 resolution. A compute shader packs RGB
+values in the range 0 to 255 into a shared float32 NCHW input tensor. The demo returns that
+export to `MLContext`, calls `dispatch`, exports the output, and reads it directly in the
+presentation fragment shader. Resizing preserves the square image with black bars.
+No image data is read back to the CPU, and ordinary graphics/inference ownership handoffs
+use GPU synchronization. The only per-frame CPU upload is the triangle's rotation uniform.
+The tensor exports and all queue submissions stay on the window event thread; each export
+is returned only after its graphics work has been submitted.
+
+The demo installs `tracing_subscriber` with an NVTX layer for tracing spans and events,
+plus compact stderr logging. `RUST_LOG` controls only the stderr layer (default `warn`),
+so quiet console output preserves NVTX annotations. Initialization and frames have named
+spans; existing `MLContext` spans also reach NVTX. For example, use
+`RUST_LOG=rustnn=debug,wgpu_style_transfer=info` to see context diagnostics on stderr.
+
+Both style transfer programs use `examples/support/fast_style_transfer.rs` for their model
+builder, style choices, NPY parsing and weight downloads. The graphics demo uses
+`WgpuDevice::create_vulkan_device` for the required sharing extensions, then accesses model
+execution and tensor sharing through the public `MLContext` interface.
 
 ## Recipes
 
