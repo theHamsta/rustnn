@@ -469,6 +469,7 @@ fn main() -> Result<()> {
         .without_time()
         .with_filter(env_filter);
     tracing_subscriber::registry()
+        // nvtx verbosity is controlled by the verbosity of tracing. Use RUST_LOG env var to control
         .with(nvtx::tracing::NvtxLayer::default())
         .with(fmt)
         .init();
